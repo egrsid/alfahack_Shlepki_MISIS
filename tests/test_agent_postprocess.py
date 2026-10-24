@@ -1,9 +1,10 @@
 import numpy as np
+import pandas as pd
 import pytest
 
 import agent
 import postprocess
-from agent_eval import LABEL_METRICS, label_score
+from agent_eval import LABEL_METRICS, label_score, score
 from mocks import MockLLM, SimpleDeadline, StubEvaluator, make_best, make_multiclass_task, make_regression_task
 from test_agent_loop import FAST, experiments
 
@@ -81,6 +82,11 @@ class ShyEvaluator(StubEvaluator):
         for proba in (cand.oof, cand.test_pred):
             proba[:, k] *= 0.1
             proba /= proba.sum(axis=1, keepdims=True)
+        y = np.searchsorted(cand.meta["classes"], pd.read_csv(spec.task_dir / "train.csv")[spec.target].astype(str))
+        folds = cand.meta["fold_ids"]  # CV — по искажённым вероятностям, как у честного evaluator
+        cand.meta["fold_scores"] = [score(spec.metric, y[folds == f], cand.oof[folds == f], False)
+                                    for f in np.unique(folds)]
+        cand.cv_score, cand.cv_std = float(np.mean(cand.meta["fold_scores"])), float(np.std(cand.meta["fold_scores"]))
         return cand
 
 
@@ -92,7 +98,10 @@ def test_research_postprocesses_best_multiclass(tmp_path):
     assert result and result[0].name == "agent_post"
     post = result[0].meta["postprocess"]
     assert post["weights"]["high"] == max(post["weights"].values()) and post["gain"] > 0
-    assert np.allclose(result[0].test_pred.sum(axis=1), 1.0) and "fold_scores" not in result[0].meta
+    assert np.allclose(result[0].test_pred.sum(axis=1), 1.0)
+    # оценка по фолдам evaluator: «после» парно сравнимо с другими кандидатами (например, с fallback P3)
+    assert result[0].meta["fold_scores"] == post["folds_after"]
+    assert result[0].cv_score == pytest.approx(np.mean(post["folds_after"]))
     row = experiments(spec)[-1]
     assert row["kind"] == "postprocess" and row["status"] == "accepted" and "weights high×" in row["error"]
 

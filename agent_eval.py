@@ -13,6 +13,7 @@ import math
 import os
 import re
 import time
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -82,8 +83,35 @@ def label_score(metric: str, y: np.ndarray, labels: np.ndarray, n_classes: int) 
     raise ValueError(f"unknown label metric: {metric}")
 
 
+def _team_metrics() -> Any:
+    """metrics.py (P3) — реестр метрик команды, если он в сборке; иначе None."""
+    try:
+        import metrics
+    except ImportError:
+        return None
+    return metrics if callable(getattr(metrics, "score", None)) else None
+
+
+def _team_fallback() -> Any:
+    """fallback.py (P3), если он в сборке: его обучение моделей (параметры, ранняя остановка, таймеры)."""
+    try:
+        import fallback
+    except ImportError:
+        return None
+    return fallback if all(hasattr(fallback, a) for a in ("_fit_predict", "_params", "FallbackConfig")) else None
+
+
 def score(metric: str, y: np.ndarray, pred: np.ndarray, regression: bool) -> float:
-    """Метрика задачи: регрессия — по предсказаниям, классификация — по вероятностям (n, k)."""
+    """Метрика задачи: регрессия — по предсказаниям, классификация — по вероятностям (n, k), y — номера классов.
+
+    Есть metrics.py (P3) — считает он (так же, как fallback и сабмит); иначе — свой набор метрик ниже.
+    """
+    team = _team_metrics()
+    if team is not None:
+        try:
+            return float(team.score(metric, y, pred))
+        except KeyError:  # UnknownMetric — подкласс KeyError: метрики нет в реестре P3, пробуем свой набор
+            pass
     from sklearn.metrics import (log_loss, mean_absolute_error, mean_absolute_percentage_error,
                                  mean_squared_error, r2_score, roc_auc_score)
 
@@ -149,17 +177,51 @@ def _target_name(spec: Any) -> str:
 class LocalEvaluator:
     """evaluator.evaluate(spec, build_features, cfg, deadline) -> Candidate на фиксированных K фолдах.
 
-    Классификация — StratifiedKFold, вероятности в столбцах по отсортированным строковым меткам (meta["classes"]).
+    Фолды: заданные (folds — номер фолда для каждой используемой строки train, rows — позиции этих строк в
+    train.csv; так их отдаёт fallback P3: честная схема по периодам/дублям) или (Stratified)KFold с сидом.
+    Классификация — вероятности в столбцах по отсортированным строковым меткам (meta["classes"]).
+    early_stopping > 0 и есть fallback.py (P3) — модели обучаются как у fallback (его параметры, ранняя остановка
+    по фолду, таймер): кандидаты агента сравнимы с кандидатом fallback не только по фолдам, но и по силе моделей.
+    Иначе — фиксированные n_estimators без ранней остановки (быстро, для тестов).
     Дедлайн проверяется между фолдами: не успеваем по оценке оставшихся фолдов → TimeoutError.
     """
 
     def __init__(self, n_splits: int = 5, seed: int = 42, n_estimators: int = 300,
-                 learning_rate: float = 0.05, threads: int | None = None) -> None:
-        self.n_splits, self.seed = n_splits, seed
+                 learning_rate: float = 0.05, threads: int | None = None, *, folds: Any = None,
+                 rows: Any = None, early_stopping: int = 0) -> None:
+        self.n_splits, self.seed, self.early_stopping = n_splits, seed, early_stopping
         self.n_estimators, self.learning_rate = n_estimators, learning_rate
         self.threads = threads or os.cpu_count() or 4
+        self.folds = None if folds is None else np.asarray(folds, dtype=int)
+        self.rows = None if rows is None else np.asarray(rows, dtype=int)
         self.calls = 0
         self._cache: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+
+    def _trainer(self, name: str, model_params: dict, regression: bool, metric: str, n_rows: int,
+                 cats: list[str]) -> Any:
+        """Обучение фолда функциями fallback (P3) или None (его нет / early_stopping выключен)."""
+        team = _team_fallback() if self.early_stopping > 0 else None
+        if team is None:
+            return None
+        shape = types.SimpleNamespace(y=np.empty(n_rows), task="regression" if regression else "classification",
+                                      metric=metric)
+        cfg = team.FallbackConfig(seed=self.seed, early_stopping=self.early_stopping)
+        params = team._params(name, shape, cfg, self.threads, {k: v for k, v in model_params.items()
+                                                              if k != "cat_features"})
+
+        def train(x_tr, y_tr, x_va, y_va, x_te, stop_at):
+            return team._fit_predict(name, regression, params, x_tr, y_tr, x_va, y_va, x_te, cats, stop_at,
+                                     self.early_stopping)
+        return train
+
+    def _splits(self, x: pd.DataFrame, y: np.ndarray, regression: bool) -> list[tuple[np.ndarray, np.ndarray]]:
+        if self.folds is not None:
+            if len(self.folds) != len(x):
+                raise ValueError(f"folds cover {len(self.folds)} rows, train has {len(x)}")
+            return [(np.flatnonzero(self.folds != f), np.flatnonzero(self.folds == f)) for f in np.unique(self.folds)]
+        from sklearn.model_selection import KFold, StratifiedKFold
+        splitter = (KFold if regression else StratifiedKFold)(self.n_splits, shuffle=True, random_state=self.seed)
+        return list(splitter.split(x, y))
 
     def _load(self, spec: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
         key = str(spec.task_dir)
@@ -185,12 +247,12 @@ class LocalEvaluator:
         return (LGBMRegressor if regression else LGBMClassifier)(**{**base, **params})
 
     def __call__(self, spec: Any, build_features: Any, params: dict, deadline: Any = None) -> Candidate:
-        from sklearn.model_selection import KFold, StratifiedKFold
-
         self.calls += 1
         if spec.task_type not in ("regression", "binary", "multiclass"):
             raise ValueError(f"LocalEvaluator does not support task_type={spec.task_type!r}")
         train, test = self._load(spec)
+        if self.rows is not None:  # строки train, которые использует схема CV (индекс — исходные номера строк)
+            train = train.iloc[self.rows]
         target_name = _target_name(spec)
         drop = {spec.id_col, target_name, *(getattr(spec, "drop_cols", None) or [])}
         feats = [c for c in test.columns if c in train.columns and c not in drop]
@@ -209,47 +271,70 @@ class LocalEvaluator:
         if regression:
             y = target.to_numpy(dtype=float)
             log_target = (params or {}).get("target_transform") == "log1p" and y.min() > -1
-            splitter, n_classes = KFold(self.n_splits, shuffle=True, random_state=self.seed), 0
+            n_classes = 0
             oof, test_pred = np.zeros(len(x)), np.zeros(len(x_test))
         else:
             classes = sorted(target.astype(str).unique())
             y = np.searchsorted(np.array(classes), target.astype(str).to_numpy())
             log_target, n_classes = False, len(classes)
-            splitter = StratifiedKFold(self.n_splits, shuffle=True, random_state=self.seed)
             oof, test_pred = np.zeros((len(x), n_classes)), np.zeros((len(x_test), n_classes))
 
+        cats: list[str] = []
         if name == "catboost":
             cats = [c for c in x.columns if isinstance(x[c].dtype, pd.CategoricalDtype)]
             x, x_test = x.astype({c: str for c in cats}), x_test.astype({c: str for c in cats})
+        trainer = self._trainer(name, model_params, regression, spec.metric, len(x), cats)
+        if name == "catboost" and trainer is None:
             model_params.setdefault("cat_features", cats)
 
+        splits = self._splits(x, y, regression)
+        fold_ids = np.zeros(len(x), dtype=int)  # номер фолда каждой строки — для честной постобработки по фолдам
         fold_scores: list[float] = []
         start = time.monotonic()
-        for fold, (train_idx, valid_idx) in enumerate(splitter.split(x, y)):
+        for fold, (train_idx, valid_idx) in enumerate(splits):
+            fold_ids[valid_idx] = fold
             if deadline is not None:
                 left = _left(deadline)
-                need = (time.monotonic() - start) / fold * (self.n_splits - fold) if fold else 0.0
+                need = (time.monotonic() - start) / fold * (len(splits) - fold) if fold else 0.0
                 if left <= 0 or need > left:
-                    raise TimeoutError(f"evaluation stopped after {fold}/{self.n_splits} folds: "
+                    raise TimeoutError(f"evaluation stopped after {fold}/{len(splits)} folds: "
                                        f"needs ~{need:.0f}s more, {left:.0f}s left")
-            model = self._model(name, model_params, regression)
             y_fit = np.log1p(y[train_idx]) if log_target else y[train_idx]
-            model.fit(x.iloc[train_idx], y_fit)
+            if trainer is not None:  # как у fallback P3: ранняя остановка по фолду и таймер на оставшееся время
+                left = _left(deadline)
+                stop_at = time.monotonic() + (left / (len(splits) - fold) if math.isfinite(left) else 1e9)
+                y_valid = np.log1p(y[valid_idx]) if log_target else y[valid_idx]
+                raw_valid, raw_test, _, present = trainer(x.iloc[train_idx], y_fit, x.iloc[valid_idx], y_valid,
+                                                          x_test, stop_at)
+                cls = np.asarray(present, dtype=int)
+            else:
+                model = self._model(name, model_params, regression)
+                if not regression:  # класса может не быть в обучении фолда (группы дублей): XGBoost — метки 0..k-1
+                    present = np.unique(y_fit)
+                    model.fit(x.iloc[train_idx], np.searchsorted(present, y_fit))
+                    cls = present[np.asarray(model.classes_).astype(int)]
+                    raw_valid, raw_test = model.predict_proba(x.iloc[valid_idx]), model.predict_proba(x_test)
+                else:
+                    model.fit(x.iloc[train_idx], y_fit)
+                    raw_valid, raw_test = model.predict(x.iloc[valid_idx]), model.predict(x_test)
             if regression:
-                p_valid, p_test = model.predict(x.iloc[valid_idx]), model.predict(x_test)
+                p_valid, p_test = raw_valid, raw_test
                 if log_target:
                     p_valid, p_test = np.expm1(p_valid), np.expm1(p_test)
-            else:  # колонки вероятностей по model.classes_, если в фолде не было какого-то класса
-                cls = np.asarray(model.classes_).astype(int)
+            else:  # колонки вероятностей по классам, которые были в обучении фолда
                 p_valid, p_test = np.zeros((len(valid_idx), n_classes)), np.zeros((len(x_test), n_classes))
-                p_valid[:, cls], p_test[:, cls] = model.predict_proba(x.iloc[valid_idx]), model.predict_proba(x_test)
+                if raw_valid is None:  # в обучении фолда один класс
+                    p_valid[:, cls[0]], p_test[:, cls[0]] = 1.0, 1.0
+                else:
+                    p_valid[:, cls], p_test[:, cls] = raw_valid, raw_test
             oof[valid_idx] = p_valid
-            test_pred += p_test / self.n_splits
+            test_pred += p_test / len(splits)
             fold_scores.append(score(spec.metric, y[valid_idx], p_valid, regression))
 
-        meta = {"fold_scores": fold_scores, "model": name, "params": model_params,
-                "target_transform": "log1p" if log_target else None, "n_splits": self.n_splits, "seed": self.seed,
-                "evaluator": "local"}
+        meta = {"fold_scores": fold_scores, "fold_ids": fold_ids, "model": name, "params": model_params,
+                "target_transform": "log1p" if log_target else None, "n_splits": len(splits), "seed": self.seed,
+                "evaluator": "local", "folds_from": "given" if self.folds is not None else "kfold",
+                "trainer": "fallback" if trainer is not None else "fixed"}
         if classes:
             meta["classes"] = classes
         return Candidate(name=f"local_{name}", cv_score=float(np.mean(fold_scores)),

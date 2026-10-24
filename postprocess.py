@@ -1,9 +1,9 @@
 """Постобработка вероятностей (P4): множители классов под метрики по меткам (macro F1, accuracy, ...).
 
 Класс = argmax(p · w). Веса подбираются координатным подъёмом по лог-сетке на OOF-вероятностях.
-Честная оценка: OOF-строки делятся на K частей (фиксированный сид), веса подбираются на K−1 частях и
-проверяются на оставшейся; оценки «до» (w = 1) и «после» на одних и тех же частях идут в обычное
-правило принятия агента. Только numpy/pandas; LLM не вызывается.
+Честная оценка: OOF-строки делятся на части — фолды evaluator (если переданы) или K случайных частей с
+фиксированным сидом; веса подбираются на остальных частях и проверяются на оставшейся; оценки «до» (w = 1) и
+«после» на одних и тех же частях идут в обычное правило принятия агента. Только numpy/pandas; LLM не вызывается.
 """
 
 from __future__ import annotations
@@ -76,10 +76,11 @@ def _fit(y: np.ndarray, proba: np.ndarray, metric: str, rounds: int = 2) -> np.n
 
 
 def fit_class_weights(y: Any, proba: Any, metric: str, *, classes: Iterable | None = None, n_splits: int = 5,
-                      seed: int = 42) -> PostResult | None:
+                      seed: int = 42, parts: Any = None) -> PostResult | None:
     """Множители вероятностей классов под метрику по меткам; None — метрика не по меткам или данные не те.
 
     y — исходные метки; столбцы proba идут в порядке classes (по умолчанию — отсортированные строковые метки).
+    parts — номер фолда evaluator для каждой строки: тогда «до/после» — по тем же фолдам, что и CV кандидата.
     """
     name = metric_name(metric)
     if name not in LABEL_METRICS or proba is None:
@@ -94,9 +95,11 @@ def fit_class_weights(y: Any, proba: Any, metric: str, *, classes: Iterable | No
     true = pd.Categorical(labels, categories=names).codes.astype(int)
     if (true < 0).any() or not np.isfinite(proba).all():
         return None
-    parts = np.random.default_rng(seed).permutation(len(true)) % n_splits
+    parts = np.asarray(parts, dtype=int) if parts is not None and len(parts) == len(true) else None
+    if parts is None:
+        parts = np.random.default_rng(seed).permutation(len(true)) % n_splits
     before, after = [], []
-    for part in range(n_splits):
+    for part in np.unique(parts):
         held = parts == part
         weights = _fit(true[~held], proba[~held], name)
         before.append(fast_label_score(name, true[held], proba[held].argmax(axis=1), len(names)))

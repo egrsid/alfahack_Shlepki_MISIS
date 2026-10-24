@@ -1264,7 +1264,8 @@ class _Research:
         start = time.monotonic()
         try:
             found = fit_class_weights(self.data.y, current.oof, self.data.spec_dict["metric"],
-                                      classes=meta.get("classes"), n_splits=cfg.postprocess_folds)
+                                      classes=meta.get("classes"), n_splits=cfg.postprocess_folds,
+                                      parts=meta.get("fold_ids"))
             if found is None:
                 return
             before, after = (types.SimpleNamespace(cv_score=float(np.mean(s)), cv_std=float(np.std(s)),
@@ -1274,10 +1275,16 @@ class _Research:
             weights = {name: round(float(w), 4) for name, w in zip(found.classes, found.weights)}
             status = "accepted" if decision.accept else "rejected"
             if decision.accept:
-                post_meta = {k: v for k, v in meta.items() if k != "fold_scores"}  # фолды evaluator к ним не подходят
+                by_folds = meta.get("fold_ids") is not None and len(found.folds_after) == len(meta.get("fold_scores") or [])
+                # по фолдам evaluator «после» сравнимо с другими кандидатами парно; по случайным частям — нет
+                post_meta = {k: v for k, v in meta.items() if k != "fold_scores"}
+                if by_folds:
+                    post_meta["fold_scores"] = list(found.folds_after)
                 post_meta.update(postprocess={"method": "class_weights", "weights": weights, "gain": decision.gain,
                                               "folds_before": found.folds_before, "folds_after": found.folds_after})
-                post = Candidate(name="agent_post", cv_score=float(current.cv_score) + decision.gain,
+                post_cv = (float(np.mean(found.folds_after)) if by_folds
+                           else float(current.cv_score) + decision.gain)
+                post = Candidate(name="agent_post", cv_score=post_cv,
                                  cv_std=float(current.cv_std), oof=apply_weights(current.oof, found.weights),
                                  test_pred=apply_weights(current.test_pred, found.weights), meta=post_meta)
                 self.accepted.append(post)
@@ -1822,7 +1829,7 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
     evaluate = evaluate or _optional("evaluator", "evaluate")
     if evaluate is None and cfg.local_evaluator:
         log.info("research: evaluator.evaluate (P1) недоступен — оценка своим LocalEvaluator (agent_eval.py)")
-        evaluate = LocalEvaluator()
+        evaluate = LocalEvaluator(early_stopping=100)  # с fallback.py (P3) — его обучение моделей
     if evaluate is None:
         log.warning("research: evaluator.evaluate недоступен — исследование пропущено")
         return []

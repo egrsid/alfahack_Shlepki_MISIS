@@ -32,7 +32,7 @@ def test_score_regression_and_classification():
     assert agent_eval.score("accuracy", labels, proba, regression=False) == pytest.approx(0.75)
     assert 0 < agent_eval.score("macro_f1", labels, proba, regression=False) < 1
     with pytest.raises(ValueError):
-        agent_eval.score("smape", y, y, regression=True)
+        agent_eval.score("no_such_metric", y, y, regression=True)
 
 
 def test_local_evaluator_finds_nested_files_and_reports_classes(tmp_path):
