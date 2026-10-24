@@ -75,7 +75,9 @@ class FallbackConfig:
     n_splits: int = 5
     seed: int = 42                   # тот же сид, что у заглушки evaluator P4: при cv="random" сплиты совпадают
     cv: str = "auto"                 # auto — схема по данным (период / дубли / случайная), random — всегда (Stratified)KFold
-    models: tuple[str, ...] = ("lightgbm", "xgboost", "catboost")  # CatBoost последним: на public медленнее и слабее
+    # CatBoost последним: на public медленнее и слабее. RandomForest — дёшево и ошибается иначе, чем бустинги:
+    # на public-мультиклассе лучший по сырому Macro F1 (0.625), в бленде balanced+XGB 0.6491 → 0.6526
+    models: tuple[str, ...] = ("lightgbm", "xgboost", "randomforest", "catboost")
     max_rounds: int = 5000
     early_stopping: int = 100
     try_log_target: bool = True
@@ -240,8 +242,11 @@ class TaskData:
     def frame(self, model: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
         key = "lightgbm" if model in ("lightgbm", "xgboost") else model
         if key not in self.frames:
-            x, cats = preprocess.model_frame(self.prep, self.prep.X, key)
-            x_test, _ = preprocess.model_frame(self.prep, self.prep.X_test, key)
+            kind = "sklearn" if key == "randomforest" else key
+            x, cats = preprocess.model_frame(self.prep, self.prep.X, kind)
+            x_test, _ = preprocess.model_frame(self.prep, self.prep.X_test, kind)
+            if key == "randomforest":  # sklearn: только числа, пропуски — отдельным значением
+                x, x_test = x.astype("float32").fillna(-999.0), x_test.astype("float32").fillna(-999.0)
             self.frames[key] = (x, x_test, cats)
         return self.frames[key]
 
@@ -488,7 +493,7 @@ def model_threads(model: str, n_rows: int, threads: int) -> int:
     Замеры (Mac, fallback-LightGBM, одинаковый CV): 3 000 строк — 1 поток 1 с, 15 потоков 25 с;
     87 670 строк × 10 классов — 2/4/8 потоков: 184/152/202 с; 53 308 строк — 13/11/16 с. CatBoost масштабируется хорошо.
     """
-    if model == "catboost":
+    if model in ("catboost", "randomforest"):
         return threads
     return max(1, min(max(1, threads // 2), n_rows // ROWS_PER_THREAD))
 
@@ -517,6 +522,11 @@ def _params(model: str, data: TaskData, cfg: FallbackConfig, threads: int, extra
                       one_hot_max_size=16)
         if regression:
             params["loss_function"] = "MAE" if l1 else "RMSE"
+    elif model == "randomforest":
+        params = dict(n_estimators=300, min_samples_leaf=3 if regression else 2, max_features=0.5 if regression else 0.3,
+                      n_jobs=threads, random_state=cfg.seed)
+        if not regression and metrics.get(data.metric).tunable:
+            params["class_weight"] = "balanced_subsample"
     else:
         params = dict(n_estimators=cfg.max_rounds, learning_rate=_lr(n), max_depth=7, min_child_weight=1.0,
                       subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0, tree_method="hist",
@@ -577,6 +587,11 @@ def _fit_predict(model: str, regression: bool, params: dict, x_tr: pd.DataFrame,
         est.fit(x_tr, y_tr, eval_set=[(x_es, y_es)],
                 callbacks=[lgb.early_stopping(early_stopping, verbose=False), _lgb_timer(stop_at)])
         iters = int(est.best_iteration_ or est.n_estimators)
+    elif model == "randomforest":  # без ранней остановки: время ограничено числом деревьев
+        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+        est = (RandomForestRegressor if regression else RandomForestClassifier)(**params)
+        est.fit(x_tr, y_tr)
+        iters = int(params["n_estimators"])
     elif model == "catboost":
         from catboost import CatBoostClassifier, CatBoostRegressor
         est = (CatBoostRegressor if regression else CatBoostClassifier)(**params)
@@ -816,7 +831,7 @@ def _plan(data: TaskData, cfg: FallbackConfig) -> list[tuple[str, str, dict]]:
     return jobs
 
 
-_COST = {"lightgbm": 1.0, "catboost": 2.5, "xgboost": 1.5}
+_COST = {"lightgbm": 1.0, "catboost": 2.5, "xgboost": 1.5, "randomforest": 0.6}
 
 
 def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -> Candidate:
