@@ -1,7 +1,7 @@
 """Заглушки модулей команды для тестов агента (вне ZIP).
 
 MockLLM       — вместо llm_client (P2): ответы по сценарию для каждой роли промпта.
-StubEvaluator — вместо evaluator.evaluate (P1): K-fold на фиксированном сиде, LightGBM по умолчанию.
+StubEvaluator — вместо evaluator.evaluate (P1): LocalEvaluator агента (K-fold, фиксированный сид).
 StubTuner     — вместо tuning.tune (P1): заданный ответ или маленький перебор сетки тем же evaluator.
 SimpleDeadline — вместо budget.Deadline (P1).
 SpecStub      — поля TaskSpec из schemas.py (P1), пока его нет в main.
@@ -18,11 +18,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (accuracy_score, f1_score, log_loss, mean_absolute_error,
-                             mean_squared_error, r2_score, roc_auc_score)
-from sklearn.model_selection import KFold, StratifiedKFold
 
 from agent import Candidate
+from agent_eval import LocalEvaluator
 
 
 @dataclass
@@ -105,137 +103,17 @@ class MockLLM:
 
 # ---------------------------------------------------------------- evaluator
 
-def _score(metric: str, y: np.ndarray, pred: np.ndarray, regression: bool) -> float:
-    name = metric.lower().replace("-", "_").replace(" ", "_")
-    if regression:
-        if name == "rmse":
-            return float(mean_squared_error(y, pred) ** 0.5)
-        if name == "mse":
-            return float(mean_squared_error(y, pred))
-        if name == "mae":
-            return float(mean_absolute_error(y, pred))
-        if name == "r2":
-            return float(r2_score(y, pred))
-        raise ValueError(f"unknown regression metric: {metric}")
-    labels = pred.argmax(axis=1)
-    if name in ("macro_f1", "f1_macro"):
-        return float(f1_score(y, labels, average="macro"))
-    if name in ("weighted_f1", "f1_weighted"):
-        return float(f1_score(y, labels, average="weighted"))
-    if name == "accuracy":
-        return float(accuracy_score(y, labels))
-    if name in ("logloss", "log_loss"):
-        return float(log_loss(y, pred, labels=list(range(pred.shape[1]))))
-    if name in ("roc_auc", "auc"):
-        return float(roc_auc_score(y, pred[:, 1]) if pred.shape[1] == 2
-                     else roc_auc_score(y, pred, multi_class="ovr"))
-    raise ValueError(f"unknown classification metric: {metric}")
+class StubEvaluator(LocalEvaluator):
+    """Заглушка evaluator.evaluate(spec, build_features, params, deadline) -> Candidate (P1).
 
-
-def _to_model_frame(x_train: pd.DataFrame, x_test: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    x_train, x_test = x_train.copy(), x_test.copy()
-    for col in x_train.columns:
-        if x_train[col].dtype == object or isinstance(x_train[col].dtype, pd.CategoricalDtype):
-            both = pd.concat([x_train[col], x_test[col]]).astype(object)
-            dtype = pd.CategoricalDtype(sorted(both.dropna().astype(str).unique()))
-            x_train[col] = x_train[col].astype(object).where(x_train[col].isna(), x_train[col].astype(str)).astype(dtype)
-            x_test[col] = x_test[col].astype(object).where(x_test[col].isna(), x_test[col].astype(str)).astype(dtype)
-        elif x_train[col].dtype == bool:
-            x_train[col], x_test[col] = x_train[col].astype("int8"), x_test[col].astype("int8")
-    return x_train, x_test
-
-
-class StubEvaluator:
-    """Заглушка evaluator.evaluate(spec, build_features, params, deadline) -> Candidate.
-
+    Это LocalEvaluator агента (agent_eval.py) с 4 потоками по умолчанию: тесты не зависят от числа ядер.
     params = {"model": "lightgbm|catboost|xgboost", "params": {...}, "target_transform": None|"log1p"}.
-    Сплиты и сид фиксированы, поэтому кандидаты сравнимы между собой (в том числе по fold_scores).
     """
 
     def __init__(self, n_splits: int = 5, seed: int = 42, n_estimators: int = 300,
                  learning_rate: float = 0.05, threads: int = 4) -> None:
-        self.n_splits, self.seed = n_splits, seed
-        self.n_estimators, self.learning_rate, self.threads = n_estimators, learning_rate, threads
-        self.calls = 0
-        self._cache: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
-
-    def _load(self, spec: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
-        key = str(spec.task_dir)
-        if key not in self._cache:
-            task_dir = Path(spec.task_dir)
-            self._cache[key] = (pd.read_csv(task_dir / "train.csv", low_memory=False),
-                                pd.read_csv(task_dir / "test.csv", low_memory=False))
-        return self._cache[key]
-
-    def _model(self, name: str, params: dict, regression: bool) -> Any:
-        if name == "catboost":
-            from catboost import CatBoostClassifier, CatBoostRegressor
-            base = dict(iterations=self.n_estimators, learning_rate=self.learning_rate, random_seed=self.seed,
-                        verbose=0, thread_count=self.threads, allow_writing_files=False)
-            return (CatBoostRegressor if regression else CatBoostClassifier)(**{**base, **params})
-        if name == "xgboost":
-            from xgboost import XGBClassifier, XGBRegressor
-            base = dict(n_estimators=self.n_estimators, learning_rate=self.learning_rate, random_state=self.seed,
-                        n_jobs=self.threads, tree_method="hist", enable_categorical=True)
-            return (XGBRegressor if regression else XGBClassifier)(**{**base, **params})
-        from lightgbm import LGBMClassifier, LGBMRegressor
-        base = dict(n_estimators=self.n_estimators, learning_rate=self.learning_rate, random_state=self.seed,
-                    n_jobs=self.threads, verbose=-1)
-        return (LGBMRegressor if regression else LGBMClassifier)(**{**base, **params})
-
-    def __call__(self, spec: Any, build_features: Any, params: dict, deadline: Any = None) -> Candidate:
-        self.calls += 1
-        train, test = self._load(spec)
-        drop = {spec.id_col, spec.target, *spec.drop_cols}
-        feats = [c for c in test.columns if c in train.columns and c not in drop]
-        spec_dict = {"task_type": spec.task_type, "metric": spec.metric, "cat_cols": spec.cat_cols,
-                     "date_cols": spec.date_cols, "text_cols": spec.text_cols}
-        x, x_test = build_features(train[feats].copy(), test[feats].copy(), spec_dict)
-        x, x_test = _to_model_frame(x.reset_index(drop=True), x_test.reset_index(drop=True))
-
-        name = (params or {}).get("model") or "lightgbm"
-        model_params = dict((params or {}).get("params") or {})
-        regression = spec.task_type == "regression"
-        target = train[spec.target]
-        if regression:
-            y = target.to_numpy(dtype=float)
-            log_target = (params or {}).get("target_transform") == "log1p" and y.min() > -1
-            splitter, n_classes = KFold(self.n_splits, shuffle=True, random_state=self.seed), 0
-            oof, test_pred = np.zeros(len(x)), np.zeros(len(x_test))
-        else:
-            classes = np.array(sorted(target.astype(str).unique()))
-            y = np.searchsorted(classes, target.astype(str).to_numpy())
-            log_target, n_classes = False, len(classes)
-            splitter = StratifiedKFold(self.n_splits, shuffle=True, random_state=self.seed)
-            oof, test_pred = np.zeros((len(x), n_classes)), np.zeros((len(x_test), n_classes))
-
-        if name == "catboost":
-            cats = [c for c in x.columns if isinstance(x[c].dtype, pd.CategoricalDtype)]
-            x, x_test = x.astype({c: str for c in cats}), x_test.astype({c: str for c in cats})
-            model_params.setdefault("cat_features", cats)
-
-        fold_scores = []
-        for train_idx, valid_idx in splitter.split(x, y):
-            model = self._model(name, model_params, regression)
-            y_fit = np.log1p(y[train_idx]) if log_target else y[train_idx]
-            model.fit(x.iloc[train_idx], y_fit)
-            if regression:
-                p_valid, p_test = model.predict(x.iloc[valid_idx]), model.predict(x_test)
-                if log_target:
-                    p_valid, p_test = np.expm1(p_valid), np.expm1(p_test)
-            else:  # колонки вероятностей по model.classes_, если в фолде не было какого-то класса
-                cls = np.asarray(model.classes_).astype(int)
-                p_valid, p_test = np.zeros((len(valid_idx), n_classes)), np.zeros((len(x_test), n_classes))
-                p_valid[:, cls], p_test[:, cls] = model.predict_proba(x.iloc[valid_idx]), model.predict_proba(x_test)
-            oof[valid_idx] = p_valid
-            test_pred += p_test / self.n_splits
-            fold_scores.append(_score(spec.metric, y[valid_idx], p_valid, regression))
-
-        return Candidate(name=f"stub_{name}", cv_score=float(np.mean(fold_scores)),
-                         cv_std=float(np.std(fold_scores)), oof=oof, test_pred=test_pred,
-                         meta={"fold_scores": fold_scores, "model": name, "params": model_params,
-                               "target_transform": "log1p" if log_target else None,
-                               "n_splits": self.n_splits, "seed": self.seed})
+        super().__init__(n_splits=n_splits, seed=seed, n_estimators=n_estimators, learning_rate=learning_rate,
+                         threads=threads)
 
 
 class StubTuner:

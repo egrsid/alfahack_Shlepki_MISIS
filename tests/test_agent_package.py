@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENT_FILES = ("agent.py", "prompts_agent.py", "memory.py", "error_analysis.py")
+AGENT_FILES = ("agent.py", "prompts_agent.py", "memory.py", "error_analysis.py", "agent_eval.py")
 TEAM_MODULES = {"schemas", "llm_client", "evaluator", "sandbox", "eda", "guards", "budget"}
 
 # так solution.py (P1) вызывает агента: после fallback, в try/except, submission.csv пишет только сам
@@ -39,7 +39,9 @@ class Deadline:
 
 class Llm:
     def chat(self, messages, **kw):
-        raise AssertionError("LLM must not be called")
+        if mode != "run":
+            raise AssertionError("LLM must not be called")
+        return '{"hypotheses": []}'
 
 
 task_dir = Path.cwd()
@@ -49,12 +51,16 @@ pd.DataFrame({"id": range(10), "y": 0.0}).to_csv(task_dir / "submission.csv", in
 before = (task_dir / "submission.csv").read_bytes()
 
 spec, mode = Spec(task_dir), sys.argv[1]
+config = agent.AgentConfig(local_evaluator=mode != "local_off")
 try:
-    found = agent.research(spec, None, None if mode == "no_llm" else Llm(), Deadline())
+    found = agent.research(spec, None, None if mode == "no_llm" else Llm(), Deadline(), config=config)
 except Exception as error:
     print("CALLER_CAUGHT", error)
     raise SystemExit(1)
-assert found == [], found
+if mode == "run":  # без evaluator.py (P1) агент работает на своём LocalEvaluator
+    assert (task_dir / ".agent_work" / "experiments.jsonl").exists()
+else:
+    assert found == [], found
 assert (task_dir / "submission.csv").read_bytes() == before
 print("OK", mode)
 '''
@@ -72,7 +78,7 @@ def _top_level_imports(path: Path) -> set[str]:
 
 
 def test_agent_modules_import_only_stdlib_numpy_pandas():
-    allowed = set(sys.stdlib_module_names) | {"numpy", "pandas", "prompts_agent", "memory", "error_analysis"}
+    allowed = set(sys.stdlib_module_names) | {"numpy", "pandas", *(Path(name).stem for name in AGENT_FILES)}
     for name in AGENT_FILES:
         extra = _top_level_imports(ROOT / name) - allowed
         assert not extra, f"{name}: unconditional imports {extra}"
@@ -104,8 +110,15 @@ def test_flat_layout_no_llm(tmp_path):
     assert result.returncode == 0 and "OK no_llm" in result.stdout, result.stderr[-2000:]
 
 
-def test_flat_layout_without_evaluator_skips_research(tmp_path):
-    """LLM есть, но evaluator.py (P1) ещё не в сборке → агент пропускает исследование, ничего не ломая."""
-    result = _run_flat(tmp_path, "llm", {})
-    assert result.returncode == 0 and "OK llm" in result.stdout, result.stderr[-2000:]
+def test_flat_layout_without_evaluator_uses_local_evaluator(tmp_path):
+    """LLM есть, evaluator.py (P1) ещё не в сборке → агент исследует на своём LocalEvaluator, сабмит не трогает."""
+    result = _run_flat(tmp_path, "run", {})
+    assert result.returncode == 0 and "OK run" in result.stdout, result.stderr[-2000:]
+    assert not any((tmp_path / f"{m}.py").exists() for m in TEAM_MODULES)
+
+
+def test_flat_layout_local_evaluator_off_skips_research(tmp_path):
+    """local_evaluator=False и нет evaluator.py (P1) → исследование пропущено, ничего не ломая."""
+    result = _run_flat(tmp_path, "local_off", {})
+    assert result.returncode == 0 and "OK local_off" in result.stdout, result.stderr[-2000:]
     assert "evaluator.evaluate" in result.stderr

@@ -32,24 +32,13 @@ import numpy as np
 import pandas as pd
 
 import prompts_agent as P
+from agent_eval import Candidate, LocalEvaluator, find_file  # Candidate — из schemas.py (P1), если он есть
 from error_analysis import analyze_errors
 from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
 
 log = logging.getLogger("agent")
 
-# --- контракты команды (schemas.py у P1, llm_client.py у P2); пока их нет — локальные заменители ---
-try:
-    from schemas import Candidate
-except ImportError:
-    @dataclass
-    class Candidate:
-        name: str
-        cv_score: float
-        cv_std: float
-        oof: np.ndarray
-        test_pred: np.ndarray  # в «сырых» единицах (вероятности для классификации)
-        meta: dict = field(default_factory=dict)
-
+# --- контракт llm_client.py (P2); пока его нет — локальный заменитель ---
 try:
     from llm_client import LLMUnavailable
 except ImportError:
@@ -90,6 +79,7 @@ class AgentConfig:
     min_start_seconds: float = 300.0    # если до конца окна research меньше — не начинаем
     llm_reserve_seconds: float = 60.0   # оценка времени на вызовы LLM за одну итерацию
     # песочница и оценка
+    local_evaluator: bool = True        # нет evaluator.py (P1) → свой LocalEvaluator (agent_eval.py); False → []
     features_timeout: float = 300.0
     evaluate_timeout: float = 900.0
     max_feature_cols: int = 2000
@@ -444,19 +434,7 @@ def spec_to_dict(spec: Any, columns: list[str]) -> dict:
                               if k in cols}}
 
 
-def _find_file(spec: Any, name: str) -> Path:
-    """Файл задачи: поле spec.<stem>_path, каталог задачи или подкаталоги (в task.md пути бывают вложенные)."""
-    explicit = getattr(spec, f"{name.split('.')[0]}_path", None)
-    if explicit and Path(explicit).is_file():
-        return Path(explicit)
-    task_dir = Path(spec.task_dir)
-    if (task_dir / name).is_file():
-        return task_dir / name
-    found = sorted((p for p in task_dir.rglob(name) if ".agent_work" not in p.parts),
-                   key=lambda p: (len(p.parts), str(p)))
-    if not found:
-        raise FileNotFoundError(f"{name} not found in {task_dir}")
-    return found[0]
+_find_file = find_file  # перенесено в agent_eval.py: файлы задачи ищет и свой evaluator
 
 
 def load_task_data(spec: Any) -> TaskData:
@@ -1579,6 +1557,9 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
         log.info("research: до конца окна %.0f с < %.0f с — исследование пропущено", left, cfg.min_start_seconds)
         return []
     evaluate = evaluate or _optional("evaluator", "evaluate")
+    if evaluate is None and cfg.local_evaluator:
+        log.info("research: evaluator.evaluate (P1) недоступен — оценка своим LocalEvaluator (agent_eval.py)")
+        evaluate = LocalEvaluator()
     if evaluate is None:
         log.warning("research: evaluator.evaluate недоступен — исследование пропущено")
         return []

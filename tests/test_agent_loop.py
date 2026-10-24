@@ -59,8 +59,9 @@ def test_deadline_exhausted_before_start(reg_task):
     assert result == [] and llm.calls == [] and evaluator.calls == 1  # только fallback-кандидат из теста
 
 
-def test_no_evaluator_returns_empty(reg_task):
-    assert agent.research(reg_task, None, MockLLM(), SimpleDeadline(600), config=agent.AgentConfig(**FAST)) == []
+def test_no_evaluator_and_local_off_returns_empty(reg_task):
+    config = agent.AgentConfig(**FAST, local_evaluator=False)
+    assert agent.research(reg_task, None, MockLLM(), SimpleDeadline(600), config=config) == []
 
 
 def test_stub_evaluator_is_deterministic(reg_task, tmp_path):

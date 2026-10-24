@@ -6,8 +6,9 @@
     .venv/bin/python tools/try_agent.py "Регрессия/task.md" --iters 3     # живой Qwen
     .venv/bin/python tools/try_agent.py "Регрессия/task.md" --dry-run --tune   # + подбор (StubTuner, пока нет P1)
 
-Ключ и адрес — из переменных окружения или .env (python-dotenv). Оценка — StubEvaluator из tests/mocks.py
-(или evaluator.evaluate, когда P1 смержит харнесс). Спецификация задачи — эвристики ниже (до task_understanding P2).
+Ключ и адрес — из переменных окружения или .env (python-dotenv). Оценка — evaluator.evaluate (P1), если он
+есть, иначе LocalEvaluator агента (agent_eval.py) — как в боевом запуске.
+Спецификация задачи — эвристики ниже (до task_understanding P2).
 Отчёт: <каталог задачи>/.agent_work/try_report.json.
 """
 
@@ -29,8 +30,8 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
 import agent  # noqa: E402
 import prompts_agent as P  # noqa: E402
-from mocks import (LIGHTGBM_GRID, MockLLM, SimpleDeadline, SpecStub, StubEvaluator, StubTuner, fenced,  # noqa: E402
-                   make_best, plan)
+from mocks import (LIGHTGBM_GRID, MockLLM, SimpleDeadline, SpecStub, StubTuner, fenced, make_best,  # noqa: E402
+                   plan)
 
 METRICS = [(r"macro[\s_-]*f1|f1[\s_-]*macro", "macro_f1", True), (r"weighted[\s_-]*f1", "weighted_f1", True),
            (r"\brmse\b", "rmse", False), (r"\bmae\b", "mae", False), (r"roc[\s_-]*auc|\bauc\b", "roc_auc", True),
@@ -156,7 +157,7 @@ def main() -> int:
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--minutes", type=float, default=30.0, help="окно research")
     parser.add_argument("--max-tokens", type=int, default=40_000, help="потолок токенов агента на прогон")
-    parser.add_argument("--trees", type=int, default=300, help="деревьев в StubEvaluator")
+    parser.add_argument("--trees", type=int, default=300, help="деревьев в LocalEvaluator")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--dry-run", action="store_true", help="MockLLM вместо Qwen: бюджет не тратится")
     parser.add_argument("--tune", action="store_true",
@@ -187,10 +188,10 @@ def main() -> int:
     print(f"spec: {spec.task_type}, metric={spec.metric} (greater={spec.greater_is_better}), "
           f"target={spec.target}, id={spec.id_col}, cat_cols={spec.cat_cols}, notes={len(spec.feature_notes)}")
 
-    evaluate = agent._optional("evaluator", "evaluate") or StubEvaluator(n_splits=args.folds,
-                                                                          n_estimators=args.trees)
+    evaluate = agent._optional("evaluator", "evaluate") or agent.LocalEvaluator(n_splits=args.folds,
+                                                                                n_estimators=args.trees)
     start = time.monotonic()
-    best = make_best(spec, evaluate) if isinstance(evaluate, StubEvaluator) else None
+    best = make_best(spec, evaluate) if isinstance(evaluate, agent.LocalEvaluator) else None
     print(f"fallback-кандидат: cv={best.cv_score:.5g} ± {best.cv_std:.3g} за {time.monotonic() - start:.0f} с"
           if best else "fallback-кандидат: нет (реальный evaluator)")
 
