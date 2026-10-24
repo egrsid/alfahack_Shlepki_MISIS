@@ -114,5 +114,6 @@ LLM_DISABLED=1 .venv/bin/python -m pytest tests/ -q
 - Не коммитить: `.env`, ключи, данные (`*.csv`), `*.zip`, `.venv`, `.llm_cache/`, `.agent_work/`.
 
 ## Статус
-- Ветка создана от `feature/agent-strategies` (`7ebe7a9`); шаг 0 выполнен.
+- Ветка создана от `feature/agent-strategies` (`7ebe7a9`); шаги 0–5 выполнены (замеры и ограничения — `docs/plans/feature-agent-models.md`, «Статус выполнения»).
+- Замеры сделаны случайным K-fold и завышены; P3 нашёл честную схему CV (`fallback.cv_folds`) — следующий шаг: `LocalEvaluator` на неё, затем интеграция с fallback (P3) и `llm_client` (P2).
 - `origin/main` ушёл вперёд: смержен `sandbox.py` P5 (сигнатура `run_code(code, cwd, timeout)` совместима с агентом).
