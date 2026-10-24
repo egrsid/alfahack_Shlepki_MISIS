@@ -20,6 +20,10 @@ LEVELS = ("low", "mid", "high")
 TUNE_KIND = "tune"  # подбор гиперпараметров тюнером (P1); предлагается, только если тюнер есть
 TUNE_KIND_LINE = ("- tune: automatic hyperparameter search for the current model on the current features "
                   "(no code is written; title like \"Tune lightgbm hyperparameters\"); best after features stop improving")
+MODEL_SEARCH_KIND = "model_search"  # сравнить все бустинги на текущих признаках тем же evaluator, без кодера
+MODEL_SEARCH_KIND_LINE = ("- model_search: evaluate lightgbm, catboost and xgboost on the current features and keep the "
+                          "best (no code is written; title like \"Compare boosting models\"); worth it once early and "
+                          "after large feature changes")
 
 # без enum: мелкие расхождения («feature», «medium») нормализует агент, а не ремонт JSON у клиента
 PLAN_SCHEMA = {
@@ -228,7 +232,8 @@ def _hypothesis_text(hypothesis: dict) -> str:
 def build_plan_messages(*, task_line: str, task_text: str, profile: str, base_code: str, cv_text: str,
                         memory: str, n: int = 6, task_chars: int = 1200, profile_chars: int = 5000,
                         code_chars: int = 2000, memory_chars: int = 1500, errors: str = "",
-                        errors_chars: int = 800, can_tune: bool = False) -> list[dict]:
+                        errors_chars: int = 800, can_tune: bool = False,
+                        can_search_models: bool = False) -> list[dict]:
     user = (f"## Task\n{task_line}\n{clip(task_text, task_chars)}\n\n"
             f"## Data profile\n{clip(profile, profile_chars)}\n\n"
             f"## Current best solution ({cv_text})\n```python\n{clip(base_code, code_chars)}\n```\n\n"
@@ -236,8 +241,9 @@ def build_plan_messages(*, task_line: str, task_text: str, profile: str, base_co
             + f"## Memory\n{clip(memory, memory_chars)}\n\n"
             f"Propose up to {n} new hypotheses as ONE JSON object.")
     system = PLANNER_SYSTEM.format(n=n)
-    if can_tune:
-        system = system.replace(_LAST_KIND_LINE, _LAST_KIND_LINE + "\n" + TUNE_KIND_LINE)
+    extra_kinds = ([MODEL_SEARCH_KIND_LINE] if can_search_models else []) + ([TUNE_KIND_LINE] if can_tune else [])
+    if extra_kinds:
+        system = system.replace(_LAST_KIND_LINE, "\n".join([_LAST_KIND_LINE, *extra_kinds]))
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 

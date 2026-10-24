@@ -119,6 +119,12 @@ class AgentConfig:
     tune_trials: int = 30
     tune_seed: int = 42
     auto_tune: bool = True              # плато/пустой план, а подбора не было → один раз подобрать перед остановкой
+    # выбор модели (вид гипотезы model_search): все MODELS на признаках лучшего кода тем же evaluator
+    model_search: bool = True           # предлагать планировщику
+    model_search_seconds: float = 1200.0  # потолок на один выбор модели ...
+    model_search_share: float = 0.35    # ... и не больше этой доли остатка окна research
+    model_search_min_seconds: float = 30.0
+    auto_model_search: bool = True      # плато/пустой план, а выбора не было → один раз перед остановкой (до tune)
     error_chars: int = 1500
     # файлы
     workdir_name: str = ".agent_work"
@@ -332,6 +338,35 @@ MODEL_PARAMS: dict[str, dict[str, Any]] = {
                 "max_cat_to_onehot": (1, 255)},
 }
 CONSTANTS = ("MODEL", "PARAMS", "TARGET_TRANSFORM")
+# время обучения относительно lightgbm (грубо): model_search пропускает модель, которая не влезет в бюджет
+MODEL_COST = {"lightgbm": 1.0, "xgboost": 1.5, "catboost": 3.0}
+# одно понятие у разных моделей; None — аналога нет, параметр при смене модели отбрасывается
+_SHARED_PARAMS = (
+    {"lightgbm": "n_estimators", "catboost": "iterations", "xgboost": "n_estimators"},
+    {"lightgbm": "learning_rate", "catboost": "learning_rate", "xgboost": "learning_rate"},
+    {"lightgbm": "max_depth", "catboost": "depth", "xgboost": "max_depth"},
+    {"lightgbm": "reg_lambda", "catboost": "l2_leaf_reg", "xgboost": "reg_lambda"},
+    {"lightgbm": "min_child_samples", "catboost": "min_data_in_leaf", "xgboost": None},
+    {"lightgbm": "class_weight", "catboost": "auto_class_weights", "xgboost": None},
+    {"lightgbm": "subsample", "catboost": None, "xgboost": "subsample"},
+    {"lightgbm": "colsample_bytree", "catboost": None, "xgboost": "colsample_bytree"},
+)
+_CLASS_WEIGHTS = {"balanced": "Balanced", "Balanced": "balanced", "SqrtBalanced": "balanced"}
+
+
+def translate_params(params: dict, src: str, dst: str) -> tuple[dict, list[str]]:
+    """Гиперпараметры модели src → dst: общие понятия переносятся, остальное отбрасывается (второй элемент)."""
+    if src == dst:
+        return dict(params), []
+    out, dropped = {}, []
+    for key, value in params.items():
+        row = next((r for r in _SHARED_PARAMS if r.get(src) == key), None)
+        target = row.get(dst) if row else None
+        if target is None or (target in ("max_depth", "depth") and isinstance(value, (int, float)) and value <= 0):
+            dropped.append(key)  # max_depth=-1 у lightgbm — «без ограничения», у catboost/xgboost аналога нет
+            continue
+        out[target] = _CLASS_WEIGHTS.get(value, value) if isinstance(value, str) else value
+    return out, dropped
 
 
 def extract_constants(code: str) -> tuple[dict, list[str]]:
@@ -993,7 +1028,8 @@ _KIND_ALIASES = {"feature": "features", "feature_engineering": "features", "inte
                  "log_target": "target_transform", "hyperparameters": "params", "hyperparams": "params",
                  "param": "params", "models": "model", "algorithm": "model", "tuning": "tune",
                  "optuna": "tune", "hpo": "tune", "hyperparameter_search": "tune", "hyperparameter_tuning": "tune",
-                 "autotune": "tune",
+                 "autotune": "tune", "model_selection": "model_search", "compare_models": "model_search",
+                 "model_comparison": "model_search", "algorithm_search": "model_search", "models_search": "model_search",
                  "selection": "feature_selection", "drop": "feature_selection"}
 _LEVELS = {"low": 1, "mid": 2, "high": 3}
 _LEVEL_ALIASES = {"medium": "mid", "moderate": "mid", "med": "mid"}
@@ -1001,11 +1037,12 @@ _LEVEL_ALIASES = {"medium": "mid", "moderate": "mid", "med": "mid"}
 
 def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int,
                          is_duplicate: Callable[[str, str], bool] | None = None,
-                         can_tune: bool = False) -> tuple[list[Hypothesis], str]:
+                         can_tune: bool = False, can_search_models: bool = False) -> tuple[list[Hypothesis], str]:
     """Ответ планировщика → гипотезы без повторов (с памятью и между собой), по убыванию выигрыш/стоимость.
 
     tried — точные повторы названий; is_duplicate(title, kind) — повторы по смыслу (перефразированные).
-    Без тюнера (can_tune=False) гипотеза tune становится params: параметры подберёт кодер.
+    Без тюнера (can_tune=False) гипотеза tune становится params: параметры подберёт кодер;
+    без выбора модели (can_search_models=False) model_search становится model: модель сменит кодер.
     """
     analysis, items = "", data
     if isinstance(data, dict):
@@ -1025,9 +1062,12 @@ def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int
         if not key or key in seen:
             continue
         kind = re.sub(r"[\s-]+", "_", str(item.get("kind") or item.get("type") or "features").lower().strip())
-        kind = kind if kind in P.KINDS or kind == P.TUNE_KIND else _KIND_ALIASES.get(kind, "features")
+        strategies = (P.TUNE_KIND, P.MODEL_SEARCH_KIND)
+        kind = kind if kind in P.KINDS or kind in strategies else _KIND_ALIASES.get(kind, "features")
         if kind == P.TUNE_KIND and not can_tune:
             kind = "params"
+        if kind == P.MODEL_SEARCH_KIND and not can_search_models:
+            kind = "model"
         if kind == "target_transform" and task_type != "regression":
             continue
         levels = []
@@ -1077,7 +1117,7 @@ class _Research:
                 return []
             while True:
                 self.stop_reason = self._stop_reason()
-                if self.stop_reason.startswith("plateau") and self._queue_auto_tune():
+                if self.stop_reason.startswith("plateau") and self._queue_auto_strategy():
                     self.stop_reason = ""
                 if self.stop_reason:
                     break
@@ -1086,7 +1126,7 @@ class _Research:
                     self._plan()
                     if not self.queue:
                         self.empty_plans += 1
-                        if self.empty_plans >= self.cfg.max_empty_plans and not self._queue_auto_tune():
+                        if self.empty_plans >= self.cfg.max_empty_plans and not self._queue_auto_strategy():
                             self.stop_reason = "planner gives no new hypotheses"
                             break
                         continue
@@ -1099,11 +1139,16 @@ class _Research:
         finally:
             self._finish()
 
-    def _queue_auto_tune(self) -> bool:
-        """Перед остановкой (плато, пустой план): один подбор гиперпараметров, если его ещё не было."""
-        tried = any(e.kind == P.TUNE_KIND for e in self.memory.experiments) or any(
-            h.kind == P.TUNE_KIND for h in self.queue)
-        if not self.cfg.auto_tune or self.tuner is None or tried:
+    def _queue_auto_strategy(self) -> bool:
+        """Перед остановкой (плато, пустой план): один раз выбор модели, затем один раз подбор её параметров."""
+        cfg = self.cfg
+        done = {e.kind for e in self.memory.experiments} | {h.kind for h in self.queue}
+        if cfg.model_search and cfg.auto_model_search and P.MODEL_SEARCH_KIND not in done:
+            self.queue.appendleft(Hypothesis(title="Compare lightgbm, catboost and xgboost (auto, before stopping)",
+                                             kind=P.MODEL_SEARCH_KIND, rationale="feature ideas stopped improving CV"))
+            log.info("research: no more gains from features — queued automatic model search")
+            return True
+        if not cfg.auto_tune or self.tuner is None or P.TUNE_KIND in done:
             return False
         model = normalize_model_config(extract_constants(self.base_code)[0], self.task_type)[0]
         self.queue.appendleft(Hypothesis(title=f"Tune {model} hyperparameters (auto, before stopping)",
@@ -1276,7 +1321,7 @@ class _Research:
         messages = P.build_plan_messages(
             task_line=self.task_line, task_text=self.task_text, profile=self.profile_text, base_code=self.base_code,
             cv_text=self._cv_text(), n=cfg.hypotheses_per_plan, errors=self.errors_text,
-            can_tune=self.tuner is not None,
+            can_tune=self.tuner is not None, can_search_models=cfg.model_search,
             memory=self.memory.planner_brief(cfg.memory_chars, kinds=self._kinds(), task_type=self.task_type),
             task_chars=cfg.task_text_chars, profile_chars=cfg.profile_chars, memory_chars=cfg.memory_chars)
         kw = dict(max_tokens=cfg.plan_max_tokens, temperature=cfg.plan_temperature)
@@ -1299,7 +1344,8 @@ class _Research:
         tried = self.memory.tried_titles() + [h.title for h in self.queue]
         hypotheses, analysis = normalize_hypotheses(data, self.task_type, tried, cfg.hypotheses_per_plan,
                                                     is_duplicate=self._duplicate_check(),
-                                                    can_tune=self.tuner is not None)
+                                                    can_tune=self.tuner is not None,
+                                                    can_search_models=cfg.model_search)
         if analysis:
             self.insights = P.clip(analysis, 500)
         self.queue.extend(hypotheses)
@@ -1307,13 +1353,23 @@ class _Research:
                  "; ".join(f"[{h.kind}] {h.title}" for h in hypotheses))
 
     def _kinds(self) -> tuple[str, ...]:
-        return P.KINDS + ((P.TUNE_KIND,) if self.tuner is not None else ())
+        return (P.KINDS + ((P.MODEL_SEARCH_KIND,) if self.cfg.model_search else ())
+                + ((P.TUNE_KIND,) if self.tuner is not None else ()))
 
     def _duplicate_check(self) -> Callable[[str, str], bool]:
-        """Повтор по смыслу: уже проверенная гипотеза, гипотеза в очереди или выше в этом же плане."""
+        """Повтор по смыслу: уже проверенная гипотеза, гипотеза в очереди или выше в этом же плане.
+        Выбор модели — повтор, если он уже в плане/очереди или уже делался от текущего лучшего кода."""
         pending = [(h.title, h.kind) for h in self.queue]
+        base = code_hash(self.base_code)
 
         def is_duplicate(title: str, kind: str) -> bool:
+            if kind == P.MODEL_SEARCH_KIND:  # название не важно: важно, от какого кода сравнивали модели
+                if any(k == kind for _, k in pending) or any(
+                        e.kind == kind and e.base_hash == base for e in self.memory.experiments):
+                    log.info("research: skip duplicate model search: %s", title)
+                    return True
+                pending.append((title, kind))
+                return False
             same = self.memory.find_similar(title, kind)
             if same is not None or any(self.memory.same_idea(title, kind, t, k) for t, k in pending):
                 log.info("research: skip duplicate hypothesis [%s] %s%s", kind, title,
@@ -1408,15 +1464,22 @@ class _Research:
         base_code, last_code = self.base_code, None  # база до эксперимента: _judge её заменит при принятии
         cand: Candidate | None = None
         decision: Decision | None = None
+        note = ""  # итог стратегии (какие модели сравнили) — в память рядом с решением
         try:
             if hypothesis.kind == P.TUNE_KIND:
                 code, error = self._tuned_code(n)
                 repairs = cfg.max_repairs  # чинить нечего: код писал не LLM
+            elif hypothesis.kind == P.MODEL_SEARCH_KIND:
+                code, cand, note = self._model_search(n)  # кандидат уже оценён: второй раз не оцениваем
+                error = "" if cand is not None else note
+                if cand is not None:
+                    last_code, digest = code, code_hash(code)
+                repairs = cfg.max_repairs
             else:
                 code = self._write_code(hypothesis)
                 error = "" if code else "answer has no ```python code block"
                 repairs = 0
-            while code is not None:
+            while code is not None and cand is None:
                 last_code = code
                 digest = code_hash(code)
                 same = self.memory.find_code(digest)
@@ -1439,6 +1502,8 @@ class _Research:
                 ignored = [note for note in cand.meta.get("harness_notes", []) if note.startswith(CONSTANTS)]
                 if ignored:  # LLM должна узнать, что её MODEL/PARAMS не применились
                     error = f"harness: {'; '.join(ignored)} | {error}"
+                if note:
+                    error = f"{note} | {error}"
         except LLMUnavailable:
             raise
         except Exception as exc:  # ошибка харнесса на одном эксперименте не должна останавливать цикл
@@ -1455,7 +1520,8 @@ class _Research:
             duration_s=round(duration, 1), tokens_in=self.tokens_in - tokens_in,
             tokens_out=self.tokens_out - tokens_out, columns=self._touched_columns(changed),
             diff=code_diff(base_code, last_code) if last_code else "", base_hash=code_hash(base_code)))
-        self.durations.append(duration)
+        if hypothesis.kind not in (P.TUNE_KIND, P.MODEL_SEARCH_KIND):  # у стратегий свой бюджет времени
+            self.durations.append(duration)
         self.consecutive_failures = self.consecutive_failures + 1 if status == "failed" else 0
         self.no_improve = 0 if status == "accepted" else self.no_improve + 1
         self.since_critic += status != "accepted"
@@ -1494,6 +1560,59 @@ class _Research:
         log.info("research: tuning %s in %.0fs → %s%s", model, time.monotonic() - start, tuned,
                  f" ({'; '.join(notes)})" if notes else "")
         return set_constant(self.base_code, "PARAMS", tuned), ""
+
+    def _model_search(self, n: int) -> tuple[str | None, Candidate | None, str]:
+        """Выбор модели: признаки текущего лучшего кода строятся один раз, каждая другая модель из MODELS
+        оценивается тем же evaluator. Результат — (код лучшей, её уже оценённый кандидат, итог сравнения);
+        принимать ли её вместо текущей, решает обычное правило decide."""
+        cfg = self.cfg
+        consts, problems = extract_constants(self.base_code)
+        if problems:
+            return None, None, "model search: " + "; ".join(problems)
+        current, params, transform, _ = normalize_model_config(consts, self.task_type)
+        budget = min(cfg.model_search_seconds, cfg.model_search_share * self._left())
+        if budget < cfg.model_search_min_seconds:
+            return None, None, f"model search: only {budget:.0f}s available"
+        end = time.monotonic() + budget
+        features = run_features(self.base_code, self.workdir / f"exp_{n:02d}_models", self.inputs, self.data, cfg,
+                                self.run_code, timeout=min(cfg.features_timeout, max(1.0, self._left())))
+        if features.error:
+            return None, None, f"model search: features of the current best failed: {P.clip(features.error, 500)}"
+        build = make_build_features(features.x_train, features.x_test)
+        sign = 1.0 if self.greater else -1.0
+        report = [f"{current} (current) cv={float(self.current.cv_score):.5g}"]
+        best_code, best = None, None
+        for model in sorted((m for m in MODELS if m != current), key=MODEL_COST.get):
+            left = end - time.monotonic()
+            need = self.reference_seconds * MODEL_COST[model] / MODEL_COST[current]
+            if need > left:
+                report.append(f"{model} skipped (needs ~{need:.0f}s, {left:.0f}s left)")
+                continue
+            moved, dropped = translate_params(params, current, model)
+            _, moved, _, _ = normalize_model_config({"MODEL": model, "PARAMS": moved}, self.task_type)
+            try:
+                cand = self.evaluate(self.spec, build, {"model": model, "params": moved, "target_transform": transform},
+                                     _SubDeadline(self.deadline, left))
+            except Exception as error:
+                report.append(f"{model} failed ({type(error).__name__}: {P.clip(str(error), 120)})")
+                continue
+            if cand is None or not math.isfinite(float(getattr(cand, "cv_score", math.nan))):
+                report.append(f"{model} failed (no finite CV score)")
+                continue
+            report.append(f"{model} cv={float(cand.cv_score):.5g}")
+            if best is None or sign * (float(cand.cv_score) - float(best.cv_score)) > 0:
+                if not isinstance(getattr(cand, "meta", None), dict):
+                    cand.meta = {}
+                best_code = set_constant(set_constant(self.base_code, "MODEL", model), "PARAMS", moved)
+                cand.meta.update(code=best_code, model=model, params=moved, target_transform=transform,
+                                 n_features=int(features.x_train.shape[1]), harness_notes=list(features.notes),
+                                 dropped_params=dropped)
+                best = cand
+        summary = "models: " + "; ".join(report)
+        log.info("research: %s", summary)
+        if best is None:
+            return None, None, f"model search: no other model evaluated ({summary})"
+        return best_code, best, summary
 
     def _touched_columns(self, changed: str) -> list[str]:
         """Колонки, которых касается дифф: названные литералами и целые группы spec (spec.get("cat_cols"))."""
