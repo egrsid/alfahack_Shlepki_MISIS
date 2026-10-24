@@ -9,8 +9,8 @@ from mocks import (DROP_ROWS_CODE, EXCEPTION_CODE, GOOD_CODE, INF_CODE, NO_FUNCT
                    SimpleDeadline, StubEvaluator, feature_code, fenced, make_best, make_multiclass_task,
                    make_regression_task, plan, useless_code)
 
-# авто-стратегии (выбор модели) проверяются в своих тестах: здесь цикл ведёт себя как раньше
-FAST = dict(min_start_seconds=10, llm_reserve_seconds=0, auto_model_search=False)
+# авто-стратегии (выбор модели, постобработка) проверяются в своих тестах: здесь цикл ведёт себя как раньше
+FAST = dict(min_start_seconds=10, llm_reserve_seconds=0, auto_model_search=False, postprocess=False)
 GOOD_ON_TOP = feature_code('df["x1_x2"] = df["x1"] * df["x2"]\ndf["x3_scaled"] = df["x3"] * 2.0 + 1.0')
 
 

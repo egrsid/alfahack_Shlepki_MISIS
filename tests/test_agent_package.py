@@ -8,7 +8,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENT_FILES = ("agent.py", "prompts_agent.py", "memory.py", "error_analysis.py", "agent_eval.py")
+AGENT_FILES = ("agent.py", "prompts_agent.py", "memory.py", "error_analysis.py", "agent_eval.py",
+               "postprocess.py")
 TEAM_MODULES = {"schemas", "llm_client", "evaluator", "sandbox", "eda", "guards", "budget"}
 
 # так solution.py (P1) вызывает агента: после fallback, в try/except, submission.csv пишет только сам

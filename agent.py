@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import time
+import types
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -35,6 +36,7 @@ import prompts_agent as P
 from agent_eval import Candidate, LocalEvaluator, find_file  # Candidate — из schemas.py (P1), если он есть
 from error_analysis import analyze_errors
 from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
+from postprocess import apply_weights, fit_class_weights
 
 log = logging.getLogger("agent")
 
@@ -125,6 +127,9 @@ class AgentConfig:
     model_search_share: float = 0.35    # ... и не больше этой доли остатка окна research
     model_search_min_seconds: float = 30.0
     auto_model_search: bool = True      # плато/пустой план, а выбора не было → один раз перед остановкой (до tune)
+    # конец исследования: множители вероятностей классов под метрику по меткам (macro F1, accuracy, ...)
+    postprocess: bool = True
+    postprocess_folds: int = 5          # части OOF для честной оценки весов
     error_chars: int = 1500
     # файлы
     workdir_name: str = ".agent_work"
@@ -1132,6 +1137,7 @@ class _Research:
                         continue
                     self.empty_plans = 0
                 self._iterate(self.queue.popleft())
+            self.postprocess()
             return self.result()
         except LLMUnavailable:
             self.stop_reason = "LLM unavailable"
@@ -1155,6 +1161,51 @@ class _Research:
                                          kind=P.TUNE_KIND, rationale="feature ideas stopped improving CV"))
         log.info("research: no more gains from features — queued automatic hyperparameter tuning")
         return True
+
+    def postprocess(self) -> None:
+        """Конец исследования: множители вероятностей классов под метрику по меткам — к текущему лучшему.
+
+        Веса подбираются на частях OOF и проверяются на оставшейся (postprocess.py); принимается обычным
+        правилом decide по парным частям. Кандидат — тот же код, у oof/test_pred перевзвешенные вероятности.
+        """
+        cfg = self.cfg
+        current = self.current
+        meta = (getattr(current, "meta", None) or {}) if current is not None else {}
+        if (not cfg.postprocess or current is None or self.task_type == "regression" or meta.get("postprocess")
+                or self._left() < 5):
+            return
+        start = time.monotonic()
+        try:
+            found = fit_class_weights(self.data.y, current.oof, self.data.spec_dict["metric"],
+                                      classes=meta.get("classes"), n_splits=cfg.postprocess_folds)
+            if found is None:
+                return
+            before, after = (types.SimpleNamespace(cv_score=float(np.mean(s)), cv_std=float(np.std(s)),
+                                                   meta={"fold_scores": s})
+                             for s in (found.folds_before, found.folds_after))
+            decision = decide(after, before, True, cfg)  # все метрики по меткам — чем больше, тем лучше
+            weights = {name: round(float(w), 4) for name, w in zip(found.classes, found.weights)}
+            status = "accepted" if decision.accept else "rejected"
+            if decision.accept:
+                post_meta = {k: v for k, v in meta.items() if k != "fold_scores"}  # фолды evaluator к ним не подходят
+                post_meta.update(postprocess={"method": "class_weights", "weights": weights, "gain": decision.gain,
+                                              "folds_before": found.folds_before, "folds_after": found.folds_after})
+                post = Candidate(name="agent_post", cv_score=float(current.cv_score) + decision.gain,
+                                 cv_std=float(current.cv_std), oof=apply_weights(current.oof, found.weights),
+                                 test_pred=apply_weights(current.test_pred, found.weights), meta=post_meta)
+                self.accepted.append(post)
+                self.current = post
+            top = ", ".join(f"{k}×{v:g}" for k, v in sorted(weights.items(), key=lambda kv: -kv[1])[:4])
+            self.memory.add(Experiment(
+                id=self.memory.next_id(), hypothesis=f"Class probability weights for {self.data.spec_dict['metric']}",
+                kind="postprocess", status=status, cv_score=float(current.cv_score) + decision.gain,
+                gain=decision.gain, error=f"{decision.reason} | weights {top}"[:1000],
+                duration_s=round(time.monotonic() - start, 1), base_hash=code_hash(self.base_code)))
+            log.info("research: postprocess [%s] %s | weights %s | %.1fs", status, decision.reason, top,
+                     time.monotonic() - start)
+            self.memory.dump_jsonl(self.workdir / "experiments.jsonl")
+        except Exception as error:  # постобработка — бонус, а не обязательный шаг
+            log.warning("research: postprocess failed: %s: %s", type(error).__name__, P.clip(str(error), 300))
 
     def result(self) -> list[Candidate]:
         """Принятые кандидаты по убыванию качества; при only_better_than_best — не хуже входного best."""
@@ -1693,6 +1744,8 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
         return loop.run()
     except LLMUnavailable as error:
         log.warning("research: LLM недоступна (%s) — возвращаем накопленное", P.clip(str(error), 300))
+        if loop is not None:
+            loop.postprocess()  # без LLM: множители классов по уже посчитанным OOF
     except Exception:
         log.exception("research: непредвиденная ошибка — возвращаем накопленное")
     try:
