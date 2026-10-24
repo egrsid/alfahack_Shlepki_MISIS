@@ -477,6 +477,27 @@ def spec_to_dict(spec: Any, columns: list[str]) -> dict:
 _find_file = find_file  # перенесено в agent_eval.py: файлы задачи ищет и свой evaluator
 
 
+def detect_text_cols(frame: pd.DataFrame, spec_dict: dict, sample: int = 5000) -> list[str]:
+    """Строковые колонки со свободным текстом (длинные, многословные, почти уникальные), не отмеченные в spec.
+
+    Эвристика до task_understanding (P2): как категория такая колонка бесполезна — почти все значения разные.
+    """
+    known = set(spec_dict["text_cols"]) | set(spec_dict["date_cols"])
+    found = []
+    for col in frame.columns:
+        series = frame[col]
+        if col in known or pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
+            continue
+        values = series.dropna().astype(str)
+        if values.empty:
+            continue
+        values = values.sample(min(sample, len(values)), random_state=0)
+        if (values.str.len().mean() >= 30 and values.str.split().str.len().mean() >= 3
+                and values.nunique() / len(values) >= 0.3):
+            found.append(col)
+    return found
+
+
 def load_task_data(spec: Any) -> TaskData:
     train = pd.read_csv(_find_file(spec, "train.csv"), low_memory=False)
     test = pd.read_csv(_find_file(spec, "test.csv"), low_memory=False)
@@ -486,7 +507,13 @@ def load_task_data(spec: Any) -> TaskData:
     y = train[targets[0]] if len(targets) == 1 else train[targets]
     train_x, test_x = train[features].reset_index(drop=True), test[features].reset_index(drop=True)
     nan_share = float(train_x.isna().sum().sum() / train_x.size) if train_x.size else 0.0
-    return TaskData(train_x, test_x, y.reset_index(drop=True), spec_to_dict(spec, features), nan_share)
+    spec_dict = spec_to_dict(spec, features)
+    guessed = detect_text_cols(train_x, spec_dict)
+    if guessed:  # свободный текст, которого нет в spec.text_cols: обрабатывается как текст, а не категория
+        spec_dict["text_cols"] += guessed
+        spec_dict["cat_cols"] = [c for c in spec_dict["cat_cols"] if c not in guessed]
+        log.info("research: text columns detected: %s", guessed)
+    return TaskData(train_x, test_x, y.reset_index(drop=True), spec_dict, nan_share)
 
 
 def _mini_profile(data: TaskData) -> dict:
@@ -566,6 +593,66 @@ MODEL = "lightgbm"
 PARAMS = {}
 TARGET_TRANSFORM = None
 '''
+
+# то же для задач с текстовыми колонками: + TF-IDF слов и биграмм на train+test → SVD (без таргета).
+# Предобученные модели и эмбеддинги запрещены правилами: смысл текста — только из данных задачи.
+BASE_CODE_TEXT = '''import numpy as np
+import pandas as pd
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+
+def text_svd(train_text, test_text, prefix, n_components=20):
+    """TF-IDF слов и биграмм по train+test → SVD: плотные признаки смысла текста (таргет не нужен)."""
+    both = pd.concat([train_text, test_text], ignore_index=True).fillna("").astype(str)
+    try:
+        matrix = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=20000,
+                                 sublinear_tf=True).fit_transform(both)
+    except ValueError:  # пустой словарь: ни одно слово не встречается дважды
+        return None
+    k = min(n_components, matrix.shape[1] - 1)
+    if k < 1:
+        return None
+    dense = TruncatedSVD(n_components=k, random_state=0).fit_transform(matrix)
+    columns = [f"{prefix}_svd_{i}" for i in range(k)]
+    n = len(train_text)
+    return (pd.DataFrame(dense[:n], columns=columns, index=train_text.index),
+            pd.DataFrame(dense[n:], columns=columns, index=test_text.index))
+
+
+def build_features(train, test, spec):
+    X_train, X_test = train.copy(), test.copy()
+    for col in spec.get("text_cols", []):
+        if col in X_train.columns:
+            parts = text_svd(X_train[col], X_test[col], col)
+            if parts is not None:
+                X_train, X_test = X_train.join(parts[0]), X_test.join(parts[1])
+    for df in (X_train, X_test):
+        for col in spec.get("date_cols", []):
+            if col in df.columns:
+                dates = pd.to_datetime(df[col], errors="coerce")
+                df[col + "_year"] = dates.dt.year
+                df[col + "_month"] = dates.dt.month
+                df[col + "_dayofweek"] = dates.dt.dayofweek
+                df.drop(columns=col, inplace=True)
+        for col in spec.get("text_cols", []):
+            if col in df.columns:
+                text = df[col].fillna("").astype(str)
+                df[col + "_len"] = text.str.len()
+                df[col + "_words"] = text.str.split().str.len()
+                df.drop(columns=col, inplace=True)
+    return X_train, X_test
+
+
+MODEL = "lightgbm"
+PARAMS = {}
+TARGET_TRANSFORM = None
+'''
+
+
+def base_code_for(spec_dict: dict) -> str:
+    """Стартовый модуль: с TF-IDF только при текстовых колонках (иначе — короче промпт кодера)."""
+    return BASE_CODE_TEXT if spec_dict.get("text_cols") else BASE_CODE
 
 
 # ============================================================ песочница
@@ -1245,20 +1332,26 @@ class _Research:
         self.task_text = str(getattr(self.spec, "raw_task_text", "") or "")
 
     def _init_reference(self) -> bool:
-        """Точка отсчёта: код best (если это кандидат агента) или BASE_CODE, оценённый тем же evaluator."""
+        """Точка отсчёта: код best (если это кандидат агента) или стартовый модуль (BASE_CODE, с текстом —
+        BASE_CODE_TEXT), оценённый тем же evaluator."""
         meta = (getattr(self.best, "meta", None) or {}) if self.best is not None else {}
         if meta.get("code") and math.isfinite(float(self.best.cv_score)):
             self.base_code, self.current = meta["code"], self.best
             self.reference_seconds = float(meta.get("seconds", self.reference_seconds))
             self._update_errors()
             return True
+        start_code = base_code_for(self.data.spec_dict)
         start = time.monotonic()
-        cand, error = self._evaluate_code(BASE_CODE, "exp_00_base")
+        cand, error = self._evaluate_code(start_code, "exp_00_base")
+        if cand is None and start_code != BASE_CODE:  # TF-IDF не справился (время, память) — без него
+            log.warning("research: text base features failed (%s), retrying without TF-IDF", P.clip(error, 300))
+            start_code, start = BASE_CODE, time.monotonic()
+            cand, error = self._evaluate_code(start_code, "exp_00_base")
         self.reference_seconds = time.monotonic() - start
         if cand is None:
             log.warning("research: base features failed, stopping: %s", P.clip(error, 500))
             return False
-        self.base_code, self.current = BASE_CODE, cand
+        self.base_code, self.current = start_code, cand
         best_cv = f"{float(self.best.cv_score):.5g}" if self.best is not None else "n/a"
         log.info("research: reference %s=%.5g (input best %s), %.0fs", self.data.spec_dict["metric"],
                  cand.cv_score, best_cv, self.reference_seconds)

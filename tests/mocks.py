@@ -202,6 +202,32 @@ def make_multiclass_task(root: Path, n_train: int = 450, n_test: int = 150, seed
                     greater_is_better=True, cat_cols=["proto"], raw_task_text=text)
 
 
+def make_text_task(root: Path, n_train: int = 600, n_test: int = 200, seed: int = 2) -> SpecStub:
+    """Бинарная: класс задают слова в отзыве (85% отзывов с «правильным» словом). Колонка review в spec отмечена
+    категорией, как это делают эвристики по dtype: агент сам должен распознать в ней текст."""
+    rng = np.random.default_rng(seed)
+    n = n_train + n_test
+    label = rng.choice(["neg", "pos"], n)
+    filler = np.array("the product delivery box price item color size was very quite really and it".split())
+    words = {"pos": np.array(["great", "excellent", "love", "perfect", "wonderful"]),
+             "neg": np.array(["awful", "terrible", "hate", "broken", "poor"])}
+    reviews = []
+    for kind in label:
+        tone = kind if rng.random() < 0.85 else ("neg" if kind == "pos" else "pos")
+        parts = list(rng.choice(filler, rng.integers(6, 12))) + list(rng.choice(words[tone], rng.integers(1, 3)))
+        reviews.append(" ".join(rng.permutation(parts)))
+    df = pd.DataFrame({"id": np.arange(n), "x1": rng.normal(size=n), "city": rng.choice(["a", "b"], n),
+                       "review": reviews})
+    root.mkdir(parents=True, exist_ok=True)
+    df.iloc[:n_train].assign(sentiment=label[:n_train]).to_csv(root / "train.csv", index=False)
+    df.iloc[n_train:].to_csv(root / "test.csv", index=False)
+    pd.DataFrame({"id": df.id.iloc[n_train:], "sentiment": "pos"}).to_csv(root / "sample_submission.csv", index=False)
+    text = "# Synthetic text classification\nPredict `sentiment`. Metric: Macro F1 (higher is better)."
+    (root / "task.md").write_text(text, encoding="utf-8")
+    return SpecStub(task_dir=root, id_col="id", target="sentiment", task_type="binary", metric="macro_f1",
+                    greater_is_better=True, cat_cols=["city", "review"], raw_task_text=text)
+
+
 # ---------------------------------------------------------------- ответы LLM для сценариев
 
 def fenced(code: str) -> str:

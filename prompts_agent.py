@@ -152,7 +152,8 @@ Rules:
 natively: such changes and plain median/mean imputation give zero gain. Prefer interactions, ratios, \
 differences, group statistics and counts across rows, which trees cannot build themselves.
 - The target is NOT available to feature code: no target encoding, no target statistics.
-- No external data; never use row order or row index as a feature.
+- No external data or pretrained models (for text: TF-IDF/char n-grams + SVD, keyword flags); never use row \
+order or row index as a feature.
 - Do not repeat what the memory says was already tried.
 - If an error analysis is given, prefer hypotheses that target the worst segments, classes or target ranges.
 
@@ -186,6 +187,8 @@ features) may be computed on train and test concatenated.
 datetime. Forbidden: files, network, os/sys/subprocess, open/eval/exec, printing, top-level code other than \
 imports, functions and constants. Never use the row index or row position as a feature.
 - Vectorized pandas/numpy only (no Python loops over rows): it must finish in {timeout} s.
+- Text columns (spec["text_cols"]): sklearn TfidfVectorizer (words or char n-grams) + TruncatedSVD fitted on \
+train and test together, keyword flags, lengths. No pretrained models or embeddings.
 
 Optional module-level constants (literal values only):
 MODEL = "lightgbm"        # lightgbm | catboost | xgboost
