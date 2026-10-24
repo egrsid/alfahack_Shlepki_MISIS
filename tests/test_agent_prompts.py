@@ -149,12 +149,13 @@ def test_prompts_with_long_memory_fit_budget(regression_like, n):
     columns = [c["name"] for c in profile["columns"]]
     memory = history(columns, n)
     cfg = agent.AgentConfig()
-    brief = memory.planner_brief(cfg.memory_chars, kinds=P.KINDS, task_type="regression")
+    kinds = P.KINDS + (P.MODEL_SEARCH_KIND, P.TUNE_KIND)  # худший случай: все виды-стратегии доступны
+    brief = memory.planner_brief(cfg.memory_chars, kinds=kinds, task_type="regression")
     plan = P.build_plan_messages(
         task_line="type: regression | metric: rmse (lower is better) | target: site_eui", task_text=task_text,
         profile=P.render_profile(profile, notes, max_chars=cfg.profile_chars), base_code=base_code,
         cv_text="CV rmse = 41.23", memory=brief, n=6, memory_chars=cfg.memory_chars,
-        errors="e" * 2000, errors_chars=cfg.errors_chars)
+        errors="e" * 2000, errors_chars=cfg.errors_chars, can_tune=True, can_search_models=True)
     code = P.build_code_messages(
         task_line="type: regression | metric: rmse", columns=P.render_columns_brief(profile), insights="x" * 500,
         base_code=base_code, cv_text="CV rmse = 41.2", hypothesis={"title": "Log of floor_area", "kind": "features"},

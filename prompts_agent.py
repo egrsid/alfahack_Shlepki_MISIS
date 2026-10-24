@@ -21,9 +21,8 @@ TUNE_KIND = "tune"  # подбор гиперпараметров тюнером
 TUNE_KIND_LINE = ("- tune: automatic hyperparameter search for the current model on the current features "
                   "(no code is written; title like \"Tune lightgbm hyperparameters\"); best after features stop improving")
 MODEL_SEARCH_KIND = "model_search"  # сравнить все бустинги на текущих признаках тем же evaluator, без кодера
-MODEL_SEARCH_KIND_LINE = ("- model_search: evaluate lightgbm, catboost and xgboost on the current features and keep the "
-                          "best (no code is written; title like \"Compare boosting models\"); worth it once early and "
-                          "after large feature changes")
+MODEL_SEARCH_KIND_LINE = ("- model_search: compare lightgbm, catboost and xgboost on the current features, keep the "
+                          "best (no code; title like \"Compare boosting models\")")
 
 # без enum: мелкие расхождения («feature», «medium») нормализует агент, а не ремонт JSON у клиента
 PLAN_SCHEMA = {
@@ -152,8 +151,7 @@ Rules:
 natively: such changes and plain median/mean imputation give zero gain. Prefer interactions, ratios, \
 differences, group statistics and counts across rows, which trees cannot build themselves.
 - The target is NOT available to feature code: no target encoding, no target statistics.
-- No external data or pretrained models (for text: TF-IDF/char n-grams + SVD, keyword flags); never use row \
-order or row index as a feature.
+- No external data or pretrained models (text: TF-IDF + SVD); never use row order or row index as a feature.
 - Do not repeat what the memory says was already tried.
 - If an error analysis is given, prefer hypotheses that target the worst segments, classes or target ranges.
 

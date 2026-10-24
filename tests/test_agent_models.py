@@ -61,7 +61,7 @@ def test_model_search_accepts_better_model_without_coder(reg_task):
     row = experiments(reg_task)[0]
     assert row["status"] == "accepted" and row["error"].startswith("models: lightgbm (current) cv=")
     assert "xgboost cv=" in row["error"] and "catboost cv=" in row["error"]
-    assert "- model_search: evaluate lightgbm, catboost and xgboost" in llm.calls[0][1][0]["content"]
+    assert "- model_search: compare lightgbm, catboost and xgboost" in llm.calls[0][1][0]["content"]
 
 
 def test_model_search_rejected_when_current_model_is_best(reg_task):
