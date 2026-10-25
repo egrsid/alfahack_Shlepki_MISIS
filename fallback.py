@@ -71,7 +71,9 @@ class HeuristicSpec:
 
 @dataclass
 class FallbackConfig:
-    time_budget: float = 1500.0      # потолок на весь fallback, с (25 мин из 3 ч: с запасом на усреднение по сидам)
+    # потолок на весь fallback, с (45 мин из 3 ч): AutoGluon на отложенных частях обеих public-задач слабее fallback,
+    # а на железе платформы (8 vCPU, медленнее ноутбука) мультиклассу с 5 сидами 25 мин может не хватить
+    time_budget: float = 2700.0
     reserve: float = 20.0            # не трогаем последние N секунд дедлайна
     n_splits: int = 5
     seed: int = 42                   # тот же сид, что у заглушки evaluator P4: при cv="random" сплиты совпадают
@@ -93,11 +95,12 @@ class FallbackConfig:
     entity: bool = True              # признаки по таргету повторяющейся сущности (регрессия/бинарная), берутся по CV
     decision_seconds: float = 40.0
     # итоговые модели (одиночная или участники бленда) переобучаются с bag_seeds сидами и усредняются: снижает дисперсию
-    # без подгонки под CV (public-регрессия: сиды 42/43/44 — 41.37/41.78/41.86, среднее трёх — 41.31)
+    # без подгонки под CV (public-регрессия: сиды 42/43/44 — 41.37/41.78/41.86, среднее трёх — 41.31; отложенный год 5:
+    # 3 сида — 30.31, 5 сидов — 30.08 RMSE по знакомым штатам). Не успеваем все — сколько успеваем, но не меньше двух
     # test-прогноз — среднее моделей фолдов, а не одна модель на всём train: проверено на отложенном годе public-регрессии
     # (модель на годах 1–4 → год 5) — переобучение на всём train хуже на 1.3–7 RMSE (модели «без одного периода»
     # устойчивее к эффектам конкретного периода), на мультиклассе — в пределах шума (+0.001)
-    bag_seeds: int = 3
+    bag_seeds: int = 5
     write: bool = True
     threads: int | None = None
 
@@ -1021,19 +1024,24 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
         return result
 
     def bag_best() -> Candidate | None:
-        """Итоговые модели (одиночная или участники бленда) с bag_seeds сидами; None — не успеваем или не к чему."""
+        """Итоговые модели (одиночная или участники бленда) с bag_seeds сидами — или со сколькими успеваем (не меньше
+        двух); None — не успеваем или не к чему."""
         meta = best.meta
         members, member_runs = members_of(best)
         if not member_runs:
             return None
-        need = sum(r.seconds for r in member_runs) * (cfg.bag_seeds - 1)
-        if need > 0.8 * (left() - 15.0 - decision_seconds):
-            log.info("усреднение по сидам пропущено: нужно ~%.0f с, осталось %.0f с", need, left())
+        per_seed = sum(r.seconds for r in member_runs)
+        seeds = min(cfg.bag_seeds, 1 + int(0.8 * (left() - 15.0 - decision_seconds) // max(per_seed, 1e-9)))
+        if seeds < 2:
+            log.info("усреднение по сидам пропущено: сид ~%.0f с, осталось %.0f с", per_seed, left())
             return None
+        if seeds < cfg.bag_seeds:
+            log.info("усреднение по сидам: успеваем %d из %d (сид ~%.0f с, осталось %.0f с)", seeds, cfg.bag_seeds,
+                     per_seed, left())
         oof, test_pred = 0.0, 0.0
         for run_, weight in zip(member_runs, members.values()):
             oofs, tests = [run_.oof], [run_.test_pred]
-            for k in range(1, cfg.bag_seeds):
+            for k in range(1, seeds):
                 seed_key = "random_seed" if run_.model == "catboost" else "random_state"
                 again = attempt(f"{run_.name}_seed{k}", run_.model, {**run_.extra, seed_key: cfg.seed + k},
                                 run_.transform, 1.0, run_.exclude, entity=run_.entity)
@@ -1043,10 +1051,10 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
                 tests.append(again.test_pred)
             oof = oof + weight * sum(oofs) / len(oofs)
             test_pred = test_pred + weight * sum(tests) / len(tests)
-        name = f"{best.name}_bag{cfg.bag_seeds}"
+        name = f"{best.name}_bag{seeds}"
         keep = {k: meta[k] for k in ("model", "params", "target_transform", "excluded", "entity") if k in meta}
         return make_candidate(data, name, oof, test_pred, _fold_scores(data, oof),
-                              {**keep, "members": members, "bagged_seeds": cfg.bag_seeds},
+                              {**keep, "members": members, "bagged_seeds": seeds},
                               cfg, min(decision_seconds, left() / 4))
 
     def members_of(cand: Candidate) -> tuple[dict, list[Run]]:

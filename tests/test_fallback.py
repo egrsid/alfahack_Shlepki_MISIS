@@ -169,7 +169,7 @@ def test_n_threads_is_positive():
     assert F.model_threads("xgboost", 87_670, 8) == 4 and F.model_threads("lightgbm", 53_308, 8) == 4
 
 
-@pytest.mark.parametrize("budget_left, expected", [(3000.0, 1500.0), (1000.0, 980.0), (100.0, 80.0), (5.0, 20.0)])
+@pytest.mark.parametrize("budget_left, expected", [(5000.0, 2700.0), (1000.0, 980.0), (100.0, 80.0), (5.0, 20.0)])
 def test_budget_from_deadline(budget_left, expected):
     class Deadline:
         def left(self):
@@ -391,6 +391,20 @@ def test_seed_bagging_of_final_models(tmp_path):
     out = pd.read_csv(tmp_path / "submission.csv")
     assert (out["label"].to_numpy() == np.asarray(cand.meta["classes"], dtype=object)[
         metrics.to_labels(cand.test_pred, cand.meta["decision"])]).all()  # в файле — именно усреднённый кандидат
+
+
+def test_seed_bagging_takes_as_many_seeds_as_fit(tmp_path, monkeypatch):
+    spec, _ = regression_task(tmp_path)
+    real = F.cv_model
+
+    def slow(*args, **kw):  # модель «стоит» 4 с: в бюджет 40 с все сиды не влезают
+        result = real(*args, **kw)
+        result.seconds = 4.0
+        return result
+    monkeypatch.setattr(F, "cv_model", slow)
+    cand = F.run(spec, config=_cfg(bag_seeds=10_000, time_budget=40))
+    assert 2 <= cand.meta["bagged_seeds"] < 10_000 and cand.name.endswith(f"_bag{cand.meta['bagged_seeds']}")
+    assert submission.check_file(spec) == []
 
 
 def test_seed_bagging_skipped_without_time(tmp_path):
