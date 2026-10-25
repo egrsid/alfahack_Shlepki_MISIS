@@ -107,6 +107,8 @@ class LLMClient:
         self.cache_hits = 0         # сколько раз взяли ответ из кэша
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        # бюджет кончился — до конца запуска в API не ходим: сброс только в 3:00 МСК, а каждый новый запрос — потеря времени
+        self.budget_exhausted: str | None = None
 
     def _get_client(self) -> OpenAI:
         if self._client is None:
@@ -205,6 +207,8 @@ class LLMClient:
             log.info("LLM: ответ взят из кэша")
             return cached
 
+        if self.budget_exhausted is not None:
+            raise LLMUnavailable(f"Бюджет LLM исчерпан ранее: {self.budget_exhausted}")
         client = self._get_client()
         last_error: Exception | None = None
 
@@ -224,6 +228,7 @@ class LLMClient:
                 last_error = e
                 # бюджет кончился: повторять бессмысленно, сразу сдаёмся
                 if _is_budget_error(e):
+                    self.budget_exhausted = str(e)[:200]
                     raise LLMUnavailable(f"Бюджет LLM исчерпан: {e}") from e
                 # ошибка не временная (например, неверный ключ): тоже сдаёмся сразу
                 if not _is_retryable(e):

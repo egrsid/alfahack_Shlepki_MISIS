@@ -84,6 +84,15 @@ class LLMClientTests(unittest.TestCase):
         # повторять смысла нет, значит запрос был ровно один
         self.assertEqual(fake.calls, 1)
 
+    def test_after_budget_error_no_more_requests(self):
+        client, fake = self.make_client([Exception("Budget has been exceeded"), "Привет"])
+        with self.assertRaises(LLMUnavailable):
+            client.chat(MESSAGES)
+        # до сброса бюджета новые запросы бессмысленны: сразу LLMUnavailable, без похода в API
+        with self.assertRaises(LLMUnavailable):
+            client.chat([{"role": "user", "content": "ещё"}])
+        self.assertEqual(fake.calls, 1)
+
     def test_temporary_error_is_retried(self):
         client, fake = self.make_client([connection_error(), "Привет"])
         # подменяем sleep, чтобы тест не ждал настоящие секунды
