@@ -171,15 +171,16 @@ def pick(spec: Any, current: Any, options: list, trusted: Any, stage: str) -> An
     return winner
 
 
-def improve(spec: Any, best: Any, current: Any, extra: list, stage: str) -> Any:
-    """Бленд «все модели fallback + extra» и сами extra; что честно лучше записанного — пишется. Возвращает
+def improve(spec: Any, best: Any, current: Any, extra: list, stage: str, members: list = ()) -> Any:
+    """Бленд «все модели fallback + extra + members» и сами extra; что честно лучше записанного — пишется.
+    members — только члены бленда (пул агента: как отдельный сабмит не прошли его правило принятия). Возвращает
     то, что теперь в файле."""
     options = list(extra)
-    if extra:
+    if extra or members:
         try:
             import ensemble
             # fallback — с честным OOF: его веса бленда подобраны на тех же строках, а ensemble оценивает честно
-            mixed = ensemble.blend(spec, [fallback.honest_view(best), *fallback.pool(best), *extra])
+            mixed = ensemble.blend(spec, [fallback.honest_view(best), *fallback.pool(best), *extra, *members])
             if mixed is not None:
                 options.insert(0, mixed)
         except Exception:
@@ -270,7 +271,10 @@ def solve(task_path: str | Path, *, llm: Any = "auto", deadline: Deadline | None
                 import agent
                 agent_config = agent.AgentConfig(max_iters=int(os.environ["SOLUTION_AGENT_ITERS"]))
             agent_cands = run_agent(spec, best, client, deadline, agent_config)
-            current = improve(spec, best, current, [*found, *agent_cands], "агент")
+            pool = [c for c in agent_cands if (getattr(c, "meta", None) or {}).get("pool_only")]
+            accepted = [c for c in agent_cands if not (getattr(c, "meta", None) or {}).get("pool_only")]
+            log.info("агент: принято %d, в пуле бленда %d", len(accepted), len(pool))
+            current = improve(spec, best, current, [*found, *accepted], "агент", members=pool)
         except Exception:
             log.exception("агент упал — остаётся записанный сабмит")
 

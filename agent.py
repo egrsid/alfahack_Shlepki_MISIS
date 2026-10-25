@@ -107,6 +107,10 @@ class AgentConfig:
     recipe_fold_wins: float = 0.6
     holdout: bool = True
     holdout_min_gain: float = 0.0       # выигрыш на скрытом фолде против эталона рецепта должен быть больше
+    # режим рецепта: оценённые полностью, но не принятые кандидаты (выигрыш больше −шум) — члены финального бленда
+    # (только бленд, не отдельный сабмит); «почти принятые» (выигрыш > 0, но ниже порога) — объединяются в гипотезу
+    pool_size: int = 5
+    combine_near_misses: int = 2        # столько «почти принятых» → гипотеза «объединить их» (0 — выкл.)
     default_n_folds: int = 5            # если evaluator не отдал fold_scores
     suspicious_k: float = 8.0           # «чудесный» скачок: gain > suspicious_k · SE ...
     suspicious_rel: float = 0.1         # ... и > 10% от |cv| → перепроверка guards
@@ -1076,6 +1080,7 @@ def make_build_features(x_train: pd.DataFrame, x_test: pd.DataFrame) -> Callable
 # ============================================================ решение «принять / отклонить»
 
 SCREEN_REJECT = "screen:"  # начало ошибки эксперимента, отсеянного скринингом (не сбой: без ремонта кода)
+COMBINE_PREFIX = "Combine near misses:"  # гипотеза-объединение «почти принятых» (сама в объединение не идёт)
 USELESS_REJECT = "useless:"  # все новые колонки бесполезны деревьям (монотонные преобразования, копии)
 REJECTS = (SCREEN_REJECT, USELESS_REJECT)
 
@@ -1379,6 +1384,8 @@ class _Research:
         self.hidden = (getattr(evaluate, "holdout_fold", None)
                        if cfg.holdout and getattr(evaluate, "recipe_mode", False) else None)
         self.full_evals = 0
+        self.pool: list[Candidate] = []   # не принятые, но не хуже текущего больше шума — для финального бленда
+        self.near_misses: list[int] = []  # id экспериментов «выигрыш > 0, но ниже порога», ещё не объединённые
         self.filter_notes: list[str] = []
         self.greater = bool(getattr(spec, "greater_is_better", False))
         self.memory = ExperimentMemory()
@@ -1424,6 +1431,7 @@ class _Research:
                 self.stop_reason = ""
             if self.stop_reason:
                 break
+            self._queue_combination()
             if not self.queue:
                 self._maybe_critic()
                 self._plan()
@@ -1579,12 +1587,16 @@ class _Research:
                  current.cv_score, sign * (bagged.cv_score - current.cv_score), time.monotonic() - start)
 
     def result(self) -> list[Candidate]:
-        """Принятые кандидаты по убыванию качества; при only_better_than_best — не хуже входного best."""
+        """Принятые кандидаты по убыванию качества (при only_better_than_best — не хуже входного best), затем
+        пул (meta["pool_only"]: только члены финального бленда)."""
         cands = [c for c in self.accepted if math.isfinite(float(c.cv_score))]
         if self.cfg.only_better_than_best and self.best is not None and math.isfinite(float(self.best.cv_score)):
             sign = 1.0 if self.greater else -1.0
             cands = [c for c in cands if sign * (float(c.cv_score) - float(self.best.cv_score)) >= 0]
-        return sorted(cands, key=lambda c: float(c.cv_score), reverse=self.greater)
+        accepted = {id(c) for c in cands}
+        pool = [c for c in self.pool if id(c) not in accepted and math.isfinite(float(c.cv_score))]
+        # пул — в конце и с meta["pool_only"]: только члены финального бленда (solution.run_agent)
+        return sorted(cands, key=lambda c: float(c.cv_score), reverse=self.greater) + pool
 
     def _prepare(self) -> None:
         cfg = self.cfg
@@ -2051,6 +2063,10 @@ class _Research:
             status, error = "failed", f"internal error: {type(exc).__name__}: {_plain_error(exc, 300)}"
 
         duration = time.monotonic() - start
+        near_miss = (self.recipe and status == "rejected" and cand is not None and decision is not None
+                     and math.isfinite(decision.gain) and "suspicious jump" not in error)  # не утечку таргета
+        if near_miss and decision.gain > -decision.noise:
+            self._add_to_pool(cand, n)
         changed = code_diff(base_code, last_code, max_lines=0) if last_code else ""
         self.memory.add(Experiment(
             id=self.memory.next_id(), hypothesis=hypothesis.title, kind=hypothesis.kind, status=status,
@@ -2060,6 +2076,8 @@ class _Research:
             duration_s=round(duration, 1), tokens_in=self.tokens_in - tokens_in,
             tokens_out=self.tokens_out - tokens_out, columns=self._touched_columns(changed),
             diff=code_diff(base_code, last_code) if last_code else "", base_hash=code_hash(base_code)))
+        if near_miss and decision.gain > 0 and not hypothesis.title.startswith(COMBINE_PREFIX):
+            self.near_misses.append(self.memory.experiments[-1].id)
         if hypothesis.kind not in (P.TUNE_KIND, P.MODEL_SEARCH_KIND):  # у стратегий свой бюджет времени
             self.durations.append(duration)
         self.consecutive_failures = self.consecutive_failures + 1 if status == "failed" else 0
@@ -2071,6 +2089,33 @@ class _Research:
             self.memory.dump_jsonl(self.workdir / "experiments.jsonl")
         except OSError:
             pass
+
+    def _add_to_pool(self, cand: Candidate, n: int) -> None:
+        """Не принятый, но не хуже текущего больше шума кандидат — в пул финального бленда (лучшие pool_size)."""
+        if self.cfg.pool_size <= 0:
+            return
+        cand.name = f"agent_pool_{n:02d}"
+        cand.meta = {k: v for k, v in (cand.meta or {}).items() if k != "recipe_raw"}
+        cand.meta["pool_only"] = True  # только член бленда: как сабмит он не прошёл правило принятия агента
+        sign = 1.0 if self.greater else -1.0
+        self.pool = sorted([*self.pool, cand], key=lambda c: -sign * float(self._view(c).cv_score))[:self.cfg.pool_size]
+
+    def _queue_combination(self) -> None:
+        """combine_near_misses «почти принятых» (выигрыш > 0, но ниже порога) → гипотеза «объединить их» в начало
+        очереди: малые выигрыши поодиночке тонут в шуме, вместе могут его превысить. Кодер получает их диффы."""
+        k = self.cfg.combine_near_misses
+        if k < 2 or len(self.near_misses) < k:
+            return
+        ids, self.near_misses = self.near_misses[:k], self.near_misses[k:]
+        found = {e.id: e for e in self.memory.experiments if e.id in ids}
+        parts = [f"#{i} {found[i].hypothesis} (gain {found[i].gain:+.4g}):\n{P.clip(found[i].diff, 500)}"
+                 for i in ids if i in found]
+        title = f"{COMBINE_PREFIX} " + " + ".join(f"#{i} {found[i].hypothesis}" for i in ids if i in found)
+        self.queue.appendleft(Hypothesis(
+            title=P.clip(title, 200), kind="features",
+            rationale=("Each of these improved CV a little but stayed below the noise threshold; add ALL their "
+                       "new columns together on top of the current best:\n" + "\n\n".join(parts))))
+        log.info("research: queued combination of near misses %s", ", ".join(f"#{i}" for i in ids))
 
     def _tuned_code(self, n: int) -> tuple[str | None, str]:
         """Подбор гиперпараметров на признаках текущего лучшего кода; результат — тот же код с новым PARAMS."""
@@ -2202,7 +2247,8 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
              data: Any = None,
              tuner: TuneFn | None = None,
              screen: EvaluateFn | None = None) -> list[Candidate]:
-    """Принятые кандидаты по убыванию качества CV (первый — лучший) или [].
+    """Принятые кандидаты по убыванию качества CV (первый — лучший) или []; в конце — кандидаты пула с
+    meta["pool_only"] (режим рецепта): их можно брать только в бленд, не писать отдельно.
 
     Необязательные аргументы — для тестов и для P1: подменить evaluator/песочницу/профиль
     и передать уже загруженные данные. По умолчанию берутся модули команды, если они есть.
