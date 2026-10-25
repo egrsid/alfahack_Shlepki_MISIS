@@ -9,6 +9,16 @@ cands[0] — опорный кандидат (лучший у fallback): его 
 подбираются на остальных фолдах (fold_scores/fold_scores_eff — по этим «чужим» весам), итоговые веса для test — на
 всех OOF; порог/веса классов — тоже по чужим фолдам (metrics.crossfit_decision). Решение «писать ли бленд» —
 у вызывающего по парным фолдам с порогом шума (fallback.clearly_better). None — бленд не нужен или невозможен.
+
+Test похож не на все строки train одинаково (recent, new_levels — можно выключить):
+- схема CV «по периодам» (test — новый период): веса подбираются по OOF поздней половины периодов (честно: для
+  фолда f — по поздним строкам остальных фолдов). Копия public-регрессии «годы 1–4 → год 5»: бленд с зоопарком
+  30.05 по всем строкам → 29.83 по двум последним годам (RMSE без нового штата);
+- строки test с уровнем категории, которого нет во всём train, получают отдельный бленд, подобранный на
+  «стресс-строках» OOF — тех, чей уровень не встречался в train их фолда (модель фолда видела его так же впервые).
+  На новых уровнях модели расходятся в разы: та же копия, новый в test штат — XGBoost 53 RMSE против ~40 у LightGBM
+  с лог-таргетом и RandomForest, а в бленде у XGBoost вес 0.7. Оценка CV бленда от этого не меняется (на OOF таких
+  строк нет), меняется только test_pred этих строк; meta["new_levels"] — сколько строк и с какими весами.
 """
 
 from __future__ import annotations
@@ -26,6 +36,8 @@ log = logging.getLogger("ensemble")
 
 MAX_STEPS = 30
 MAX_POOL = 16      # кандидатов в отборе (сильнейшие по своему OOF)
+MIN_FIT_ROWS = 50  # меньше поздних строк вне фолда — веса фолда по всем его остальным строкам
+STRESS_MIN_ROWS = 100  # меньше стресс-строк OOF — отдельного бленда для новых уровней нет
 
 
 def _truth(spec: Any, ref: Any) -> np.ndarray:
@@ -85,7 +97,59 @@ def _mix(weights: np.ndarray, arrays: list[np.ndarray], rows: Any = slice(None))
     return sum(w * a[rows] for w, a in zip(weights, arrays) if w > 0)
 
 
-def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0) -> Any | None:
+def _data(meta: dict, n_rows: int) -> Any:
+    """Данные fallback (TaskData) опорного кандидата, если они про те же строки OOF; иначе None."""
+    data = getattr(meta.get("context"), "data", None)
+    return data if data is not None and len(data.y) == n_rows else None
+
+
+def recent_rows(meta: dict, n_rows: int) -> np.ndarray | None:
+    """Строки OOF поздней половины периодов (схема CV «по периодам», уровней ≥ 3); None — все строки."""
+    data = _data(meta, n_rows)
+    if data is None or (getattr(data, "cv_scheme", None) or {}).get("kind") != "period" or data.period_order is None:
+        return None
+    order = np.asarray(data.period_order, dtype=float)
+    levels = np.unique(order[np.isfinite(order)])
+    if len(levels) < 3:
+        return None
+    return order >= levels[len(levels) // 2]
+
+
+def recent_folds(meta: dict, n_rows: int) -> list[int] | None:
+    """Номера фолдов (в порядке fold_scores), где большинство строк — поздняя половина периодов; меньше двух — None
+    (парное сравнение по одному фолду — шум)."""
+    fit = recent_rows(meta, n_rows)
+    folds = meta.get("folds")
+    if fit is None or folds is None:
+        return None
+    folds = np.asarray(folds, dtype=int)
+    picked = [i for i, f in enumerate(np.unique(folds)) if fit[folds == f].mean() >= 0.5]
+    return picked if len(picked) >= 2 else None
+
+
+def new_level_rows(meta: dict, folds: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """(стресс-строки OOF: уровень категории встречается только в своём фолде — модель фолда его не видела;
+    строки test с уровнем, которого нет во всём train) по категориальным колонкам fallback или None."""
+    data = _data(meta, len(folds))
+    prep = getattr(data, "prep", None)
+    if prep is None or len(prep.X) != len(folds):
+        return None
+    stress, risky = np.zeros(len(folds), dtype=bool), np.zeros(len(prep.X_test), dtype=bool)
+    for col in prep.cat_cols:
+        if col not in prep.X.columns or col not in prep.X_test.columns:
+            continue
+        train, test = prep.X[col].astype(object), prep.X_test[col].astype(object)
+        risky |= test.notna().to_numpy() & ~test.isin(set(train.dropna())).to_numpy()
+        codes = pd.Series(pd.factorize(train)[0])          # −1 — пропуск
+        table = pd.crosstab(codes, folds)                  # уровень × фолд
+        single = table.index[(table > 0).sum(axis=1) == 1]
+        single = single[single >= 0]
+        stress |= codes.isin(set(single)).to_numpy()
+    return stress, risky
+
+
+def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0, recent: bool = True,
+          new_levels: bool = True) -> Any | None:
     if len(cands) < 2:
         return None
     ref = cands[0]
@@ -100,6 +164,8 @@ def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0) -> Any
         log.warning("ensemble: таргет %d строк, фолдов %d — без бленда", len(y), len(folds))
         return None
 
+    fit = recent_rows(meta, len(y)) if recent else None
+    fit_all = np.ones(len(y), dtype=bool) if fit is None else fit
     entries: list[tuple[str, np.ndarray, np.ndarray, float]] = []
     seen: set[str] = set()
     for cand in cands:
@@ -109,31 +175,46 @@ def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0) -> Any
                 log.info("ensemble: %s не совпадает с %s по строкам/классам — пропущен", cand.name, ref.name)
             continue
         seen.add(cand.name)
-        entries.append((cand.name, pair[0], pair[1], float(metrics.score(metric, y, pair[0]))))
+        entries.append((cand.name, pair[0], pair[1], float(metrics.score(metric, y[fit_all], pair[0][fit_all]))))
     if len(entries) < 2:
         return None
     sign = 1.0 if metrics.greater_is_better(metric) else -1.0
-    entries = sorted(entries, key=lambda e: -sign * e[3])[:MAX_POOL]  # сильнейшие по своему OOF
+    entries = sorted(entries, key=lambda e: -sign * e[3])[:MAX_POOL]  # сильнейшие по своему OOF (на строках fit)
     names = [e[0] for e in entries]
     oofs, tests = [e[1] for e in entries], [e[2] for e in entries]
 
-    weights = caruana(y, oofs, metric)
+    weights = caruana(y[fit_all], [o[fit_all] for o in oofs], metric)
     if (weights > 0).sum() < 2:
         log.info("ensemble: бленд не нужен — лучше всех одна модель %s", names[int(np.argmax(weights))])
         return None
-    # честная оценка: веса для фолда f подбираются на остальных фолдах, оценка — на f
+    # честная оценка: веса для фолда f подбираются на остальных фолдах (на их поздних строках, если fit), оценка — на f
     fold_ids = np.unique(folds)
     honest = np.zeros_like(oofs[0])
     for f in fold_ids:
         inside = folds == f
-        w_f = caruana(y[~inside], [o[~inside] for o in oofs], metric)
+        rows = ~inside & fit_all
+        if rows.sum() < MIN_FIT_ROWS:
+            rows = ~inside
+        w_f = caruana(y[rows], [o[rows] for o in oofs], metric)
         honest[inside] = _mix(w_f, oofs, inside)
     fold_scores = [float(metrics.score(metric, y[folds == f], honest[folds == f])) for f in fold_ids]
     oof, test_pred = _mix(weights, oofs), _mix(weights, tests)
     used = {n: round(float(w), 4) for n, w in zip(names, weights) if w > 0}
     out_meta = {k: v for k, v in meta.items() if k not in ("decision", "fold_scores_post", "label_shift")}
     out_meta.update(blend=used, fold_scores=fold_scores, fold_scores_eff=list(fold_scores), decision=None,
-                    cv_score_post=float(np.mean(fold_scores)), metric=metric, honest_oof=True)
+                    cv_score_post=float(np.mean(fold_scores)), metric=metric, honest_oof=True,
+                    blend_rows="recent periods" if fit is not None else "all")
+    levels = new_level_rows(meta, folds) if new_levels else None
+    if levels is not None and levels[1].any() and levels[0].sum() >= STRESS_MIN_ROWS:
+        stress, risky = levels
+        w_new = caruana(y[stress], [o[stress] for o in oofs], metric)
+        test_pred = np.array(test_pred, dtype=float, copy=True)
+        test_pred[risky] = _mix(w_new, tests, risky)
+        out_meta["new_levels"] = {"test_rows": int(risky.sum()), "stress_rows": int(stress.sum()),
+                                  "test_index": [int(i) for i in np.flatnonzero(risky)],
+                                  "blend": {n: round(float(w), 4) for n, w in zip(names, w_new) if w > 0}}
+        log.info("ensemble: %d строк test с новыми уровнями категорий — бленд по %d стресс-строкам OOF: %s",
+                 int(risky.sum()), int(stress.sum()), out_meta["new_levels"]["blend"])
     if meta.get("classes") is not None and metrics.get(metric).tunable and decision_seconds > 1:
         try:
             post, decision = metrics.crossfit_decision(metric, y, honest, folds, time_limit=decision_seconds)

@@ -351,6 +351,68 @@ def _safe_name(name: str) -> str:
     return "agent__" + (re.sub(r"[^\w]", "_", str(name)).strip("_") or "col")
 
 
+def holdout_fold(data: Any) -> int | None:
+    """Фолд, который агент не видит при решениях (защита от переобучения под CV многими гипотезами).
+
+    Схема «по периодам» — фолд самого позднего периода (он ближе всего к test — новому периоду), иначе последний
+    фолд. Фолдов меньше 4 — None: без одного фолда сравнивать не на чем.
+    """
+    n = int(getattr(data, "n_splits", 0) or 0)
+    folds = getattr(data, "folds", None)
+    if n < 4 or folds is None:
+        return None
+    order = getattr(data, "period_order", None)
+    if (getattr(data, "cv_scheme", None) or {}).get("kind") == "period" and order is not None:
+        order = np.where(np.isfinite(np.asarray(order, dtype=float)), np.asarray(order, dtype=float), np.nan)
+        means = [np.nanmean(order[folds == f]) if np.isfinite(order[folds == f]).any() else -np.inf
+                 for f in range(n)]
+        return int(np.argmax(means))
+    return n - 1
+
+
+# ============================================================ действия агента над рецептом
+
+RECIPE_ACTIONS = ("drop", "weights", "target_stats")  # кроме features: их исполняет харнесс, LLM пишет только JSON
+WEIGHT_SCHEMES = ("dedup", "recency", "class")
+
+
+def row_weights(data: Any, weights: dict | None) -> np.ndarray | None:
+    """Веса строк train для действия weights (среднее 1); None — без весов. ValueError — схема неприменима.
+
+    dedup — 1 / размер группы одинаковых строк (в test близнецов нет, а частые шаблоны в train переучиваются);
+    recency — (1 + номер периода)^power (test — новый период: поздние ближе к нему);
+    class — (n / (k · n_класса))^power (power 0.5 — «sqrt», 1 — «balanced»); у dedup power смягчает так же.
+    """
+    if not weights:
+        return None
+    scheme, power = weights.get("scheme"), float(weights.get("power", 1.0))
+    if scheme == "dedup":
+        hashes = pd.util.hash_pandas_object(data.prep.X, index=False).to_numpy()
+        _, inverse, counts = np.unique(hashes, return_inverse=True, return_counts=True)
+        if counts.max() <= 1:
+            raise ValueError("dedup weights: train has no duplicate rows")
+        w = (1.0 / counts[inverse]) ** power
+    elif scheme == "recency":
+        if getattr(data, "period_order", None) is None:
+            raise ValueError("recency weights need a period CV scheme (test is a new period)")
+        ranks = pd.Series(np.asarray(data.period_order, dtype=float)).rank(method="dense").to_numpy() - 1
+        w = (1.0 + np.nan_to_num(ranks)) ** power
+    elif scheme == "class":
+        if data.task == "regression":
+            raise ValueError("class weights need a classification task")
+        counts = np.bincount(np.asarray(data.y, dtype=int), minlength=len(data.classes)).astype(float)
+        w = (len(data.y) / (len(counts) * np.maximum(counts, 1.0)))[np.asarray(data.y, dtype=int)] ** power
+    else:
+        raise ValueError(f"unknown weights scheme {scheme!r}, use one of {WEIGHT_SCHEMES}")
+    return w / w.mean()
+
+
+def drop_columns(columns: Any, drop: Any, renamed: dict) -> tuple[str, ...]:
+    """Колонки матрицы fallback, происходящие из исходных колонок drop (в т. ч. производные «col__freq»)."""
+    drop = set(drop or ())
+    return tuple(c for c in columns if _raw_name(c, renamed) in drop) if drop else ()
+
+
 class RecipeEvaluator:
     """evaluator.evaluate(spec, build_features, cfg, deadline) -> Candidate на рецепте лучшего кандидата fallback.
 
@@ -361,11 +423,18 @@ class RecipeEvaluator:
     (fallback.make_candidate). cv_score и fold_scores — эффективные (как у fallback.clearly_better), поэтому без
     новых колонок кандидат воспроизводит лучший fallback, а агент улучшает именно его. cfg (модель/параметры кода
     LLM) не используется: модели — у рецепта. recipe_mode — признак для агента («только новые колонки»).
+
+    Оценка честная, как у ensemble.blend: если лучший fallback — бленд, фолд f смешивается весами, подобранными
+    fallback на остальных фолдах (ctx.fold_members; модели вне рецепта — их OOF из fallback как есть); oof кандидата —
+    эта честная смесь, test_pred — смесь с весами рецепта. bag_seeds — сколько сидов усреднено в итоге fallback:
+    bag() доводит кандидата до того же числа сидов (те же сиды, что у fallback), чтобы сравнение с записанным
+    fallback не проигрывалось из-за одного сида против трёх.
     """
 
     recipe_mode = True
 
-    def __init__(self, best: Any, threads: int | None = None, decision_seconds: float = 20.0) -> None:
+    def __init__(self, best: Any, threads: int | None = None, decision_seconds: float = 20.0,
+                 fast: bool = True) -> None:
         ctx = (getattr(best, "meta", None) or {}).get("context")
         if ctx is None:
             raise ValueError("fallback candidate has no context")
@@ -374,6 +443,18 @@ class RecipeEvaluator:
         self.members = {name: float(w) for name, w in ctx.members.items() if name in self.runs and w > 0}
         if not self.members:
             raise ValueError("best fallback candidate has no trained members")
+        fold_members = getattr(ctx, "fold_members", None)
+        names = {name for weights in (fold_members or []) for name in weights}
+        self.fold_members = fold_members if fold_members and names <= set(self.runs) else None
+        self.base_oofs = {r.name: r.oof for r in ctx.runs}
+        self.bag_seeds = int((getattr(best, "meta", None) or {}).get("bagged_seeds") or 1)
+        self.holdout_fold = holdout_fold(ctx.data)
+        # «быстрый рецепт»: медленный член с малым весом не переобучается — его OOF/test из fallback как есть
+        # (public-мультикласс: CatBoost 240 с при весе 0.17 — эталон рецепта шёл 910 с вместо ~300)
+        seconds = {name: float(self.runs[name].seconds) for name in self.members}
+        median = float(np.median(list(seconds.values())))
+        self.frozen = ({name for name, sec in seconds.items() if sec > 1.5 * median and self.members[name] <= 0.25}
+                       if fast and len(self.members) >= 3 else set())
         self.threads = threads
         self.calls = 0
         self._inputs: tuple[pd.DataFrame, pd.DataFrame, dict] | None = None
@@ -395,12 +476,11 @@ class RecipeEvaluator:
             self._inputs = (train[feats], test[feats].reset_index(drop=True), spec_dict)
         return self._inputs
 
-    def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
+    def _frames(self, spec: Any, build_features: Any, models: Any = None) -> tuple[Any, list[str]]:
+        """Копия данных fallback, где к матрицам моделей (по умолчанию — моделей рецепта) добавлены новые колонки
+        build_features."""
         import copy as copy_module
 
-        import fallback
-
-        self.calls += 1
         ctx = self.ctx
         train, test, spec_dict = self._raw(spec)
         x_tr, x_te = build_features(train.copy(), test.copy(), spec_dict)
@@ -412,8 +492,7 @@ class RecipeEvaluator:
 
         data = copy_module.copy(ctx.data)
         data.frames = {}
-        for name in self.members:
-            model = self.runs[name].model
+        for model in models or [self.runs[name].model for name in self.members]:
             key = "lightgbm" if model in ("lightgbm", "xgboost") else model
             if key in data.frames:
                 continue
@@ -427,27 +506,318 @@ class RecipeEvaluator:
             data.frames[key] = (pd.concat([x.reset_index(drop=True), add_tr], axis=1),
                                 pd.concat([x_test.reset_index(drop=True), add_te], axis=1),
                                 cats if key == "randomforest" else [*cats, *cat_new])
+        return data, new
 
+    def action_args(self, spec: Any, data: Any, run: Any, state: dict | None) -> dict:
+        """Аргументы fallback.cv_model для состояния рецепта (накопленные действия агента): exclude с колонками
+        действия drop, sample_weight действия weights, target_keys действия target_stats."""
+        import fallback
+
+        state = state or {}
+        renamed = self.ctx.data.prep.report.get("renamed", {})
+        columns = data.frame(run.model)[0].columns
+        keys = []
+        if state.get("target_keys"):
+            train, test, _ = self._raw(spec)
+            keys = [(fallback._entity_key(train, list(cols)), fallback._entity_key(test, list(cols)))
+                    for cols in state["target_keys"]]
+        return {"exclude": tuple(run.exclude) + drop_columns(columns, state.get("drop"), renamed),
+                "sample_weight": row_weights(self.ctx.data, state.get("weights")), "target_keys": keys}
+
+    def _fit(self, data: Any, seeds: tuple[int, ...], deadline: Any, spec: Any = None,
+             state: dict | None = None) -> tuple[np.ndarray, np.ndarray, Any]:
+        """Члены рецепта, каждый усреднён по seeds (0 — сид fallback, k — сид fallback + k, как в его bag3):
+        (OOF с весами рецепта, test_pred, честный OOF по весам фолдов или None). Замороженные — из fallback."""
+        import fallback
+
+        ctx = self.ctx
         threads = self.threads or fallback.n_threads()
         oof = test_pred = None
-        for i, (name, weight) in enumerate(self.members.items()):
+        member_oofs: dict[str, np.ndarray] = {}
+        jobs, done = (len(self.members) - len(self.frozen)) * len(seeds), 0
+        for name, weight in self.members.items():
             run = self.runs[name]
-            left = _left(deadline)
-            if left <= 0:
-                raise TimeoutError(f"evaluation stopped before member {name}")
-            stop_at = time.monotonic() + (left / (len(self.members) - i) if math.isfinite(left) else 1e9)
-            fitted = fallback.cv_model(data, name, run.model, ctx.config, stop_at, transform=run.transform,
-                                       extra=dict(getattr(run, "extra", None) or {}), threads=threads,
-                                       exclude=run.exclude,
-                                       entity=run.entity)
-            oof = weight * fitted.oof if oof is None else oof + weight * fitted.oof
-            test_pred = weight * fitted.test_pred if test_pred is None else test_pred + weight * fitted.test_pred
-        scores = fallback._fold_scores(data, oof)
-        cand = fallback.make_candidate(data, "agent_recipe", oof, test_pred, scores,
+            oofs, tests = [], []
+            if name in self.frozen:
+                oofs, tests = [run.oof], [run.test_pred]
+            args = self.action_args(spec, data, run, state) if name not in self.frozen else {}
+            for seed in (() if name in self.frozen else seeds):
+                left = _left(deadline)
+                if left <= 0:
+                    raise TimeoutError(f"evaluation stopped before member {name}")
+                stop_at = time.monotonic() + (left / (jobs - done) if math.isfinite(left) else 1e9)
+                extra = dict(getattr(run, "extra", None) or {})
+                if seed:
+                    extra.update(fallback.seed_params(run.model, ctx.config.seed + seed))
+                fitted = fallback.cv_model(data, name, run.model, ctx.config, stop_at, transform=run.transform,
+                                           extra=extra, threads=threads, entity=run.entity, **args)
+                oofs.append(fitted.oof)
+                tests.append(fitted.test_pred)
+                done += 1
+            member_oofs[name] = sum(oofs) / len(oofs)
+            member_test = sum(tests) / len(tests)
+            oof = weight * member_oofs[name] if oof is None else oof + weight * member_oofs[name]
+            test_pred = weight * member_test if test_pred is None else test_pred + weight * member_test
+        honest = None
+        if self.fold_members:
+            honest = fallback.mix_by_folds(data, self.fold_members, {**self.base_oofs, **member_oofs})
+        return oof, test_pred, honest
+
+    def _candidate(self, data: Any, new: list[str], oof: np.ndarray, test_pred: np.ndarray, honest: Any,
+                   seeds: int, state: dict | None = None) -> Candidate:
+        import fallback
+
+        ctx = self.ctx
+        cand = fallback.make_candidate(data, "agent_recipe", oof, test_pred, fallback._fold_scores(data, oof),
                                        {"model": "recipe", "members": dict(self.members)}, ctx.config,
-                                       self.decision_seconds)
+                                       self.decision_seconds, honest)
+        cand = fallback.honest_view(cand)  # честная оценка: oof и оценки фолдов — по весам без этого фолда
         eff = [float(s) for s in cand.meta["fold_scores_eff"]]
         cand.meta.update(fold_scores_raw=cand.meta["fold_scores"], fold_scores=eff, fold_ids=data.folds,
-                         new_columns=new, evaluator="recipe")
+                         new_columns=new, evaluator="recipe", seeds=seeds, recipe_state=dict(state or {}),
+                         frozen=sorted(self.frozen),
+                         recipe_raw={"oof": oof, "test_pred": test_pred, "honest": honest})
+        if seeds > 1:
+            cand.meta["bagged_seeds"] = seeds
         cand.cv_score, cand.cv_std = float(np.mean(eff)), float(np.std(eff))
         return cand
+
+    def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
+        self.calls += 1
+        state = (params or {}).get("recipe_state") or {}
+        data, new = self._frames(spec, build_features)
+        oof, test_pred, honest = self._fit(data, (0,), deadline, spec, state)
+        return self._candidate(data, new, oof, test_pred, honest, 1, state)
+
+    def bag(self, spec: Any, build_features: Any, base: Any, deadline: Any = None) -> Candidate:
+        """base — кандидат этого evaluator на тех же колонках (сид fallback); дообучаются сиды 1..bag_seeds−1 и
+        усредняются с ним (смесь линейна по OOF членов, поэтому среднее смесей = смесь средних)."""
+        raw = (getattr(base, "meta", None) or {}).get("recipe_raw")
+        if raw is None or self.bag_seeds <= 1:
+            raise ValueError("nothing to bag: no recipe_raw in the base candidate or bag_seeds <= 1")
+        self.calls += 1
+        state = base.meta.get("recipe_state") or {}
+        data, new = self._frames(spec, build_features)
+        extra = tuple(range(1, self.bag_seeds))
+        oof, test_pred, honest = self._fit(data, extra, deadline, spec, state)
+        n, total = len(extra), len(extra) + 1
+
+        def average(first: Any, rest: Any) -> Any:
+            return None if first is None or rest is None else (first + n * rest) / total
+
+        return self._candidate(data, new, average(raw["oof"], oof), average(raw["test_pred"], test_pred),
+                               average(raw["honest"], honest), total, state)
+
+
+class ScreenEvaluator:
+    """Быстрая оценка гипотезы перед полной (RecipeEvaluator): лучший по CV LightGBM fallback на тех же матрицах,
+    фолдах, признаках сущности и исключениях, но с фиксированным числом деревьев (медиана его итераций у fallback, не
+    больше max_rounds — с пропорционально большим шагом; без ранней остановки) и с несколькими сидами (по умолчанию
+    2), усреднёнными на OOF.
+
+    Зачем: полная оценка переобучает все члены бленда (2–5 мин на гипотезу), а новая колонка меняет обучение деревьев
+    почти как смена сида — шум сравнения порядка самого выигрыша. Скрининг в разы быстрее, а общие сиды у эталона и
+    кандидата и отсутствие выбора итерации по валидации делают парную разность тише. Решение «принять» всё равно
+    принимается по полной оценке; скрининг только отсеивает гипотезы, которые явно не помогают.
+
+    Контракт тот же: (spec, build_features, cfg, deadline) -> Candidate; fold_scores — сырые оценки по фолдам
+    (без порога/весов классов: им нужны вероятности бленда, а для отсева достаточно сравнения моделей).
+    """
+
+    def __init__(self, recipe: RecipeEvaluator, seeds: int = 2, max_rounds: int = 300, min_rounds: int = 50,
+                 threads: int | None = None, max_train_rows: int = 30_000, seed_seconds: float = 30.0) -> None:
+        import fallback
+
+        runs = [r for r in recipe.ctx.runs if r.model == "lightgbm" and r.iterations]
+        if not runs:
+            raise ValueError("fallback has no trained LightGBM to screen with")
+        # лучший по CV LightGBM fallback (с признаками сущности, исключениями, весами классов — как он учился):
+        # самый весомый в рецепте бывает слабым (public-регрессия: lightgbm_noperiod 44.7 без сущности при 41.8)
+        sign = 1.0 if _greater(recipe.ctx.data.metric) else -1.0
+        self.run = max(runs, key=lambda r: sign * r.cv)
+        # число деревьев — как у этого LightGBM, но не больше max_rounds: шаг обучения растёт пропорционально
+        # (public-регрессия: 1276 деревьев на скрининг — дольше полного рецепта)
+        rounds = max(min_rounds, int(np.median(self.run.iterations)))
+        self.rounds = min(rounds, max_rounds)
+        base_lr = float(self.run.params.get("learning_rate", fallback._lr(len(recipe.ctx.data.y))))
+        self.learning_rate = min(0.3, base_lr * rounds / self.rounds)
+        data = recipe.ctx.data
+        rows = len(data.y) * (data.n_splits - 1) / data.n_splits  # строк обучения в фолде
+        # большая задача: подвыборка строк обучения фолда (валидация — целиком); public-мультикласс: 70 тыс. строк ×
+        # 10 классов — скрининг шёл 312 с на гипотезу
+        self.max_rows = max_train_rows if rows > 2 * max_train_rows else None
+        # оценка одного сида по времени этого LightGBM у fallback; долго — один сид (быстрее, но шумнее)
+        share = (self.max_rows / rows) if self.max_rows else 1.0
+        estimate = float(self.run.seconds) * self.rounds / max(1, rounds) * share
+        self.recipe = recipe
+        self.seeds = max(1, int(seeds)) if estimate <= seed_seconds else 1
+        self.threads = threads or recipe.threads
+        self.calls = 0
+
+    @property
+    def name(self) -> str:
+        rows = f", ≤ {self.max_rows} train rows" if self.max_rows else ""
+        return f"{self.run.name}, {self.rounds} trees, lr {self.learning_rate:.3g}, {self.seeds} seeds{rows}"
+
+    def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
+        import fallback
+
+        self.calls += 1
+        run, ctx = self.run, self.recipe.ctx
+        data, new = self.recipe._frames(spec, build_features, models=[run.model])
+        args = self.recipe.action_args(spec, data, run, (params or {}).get("recipe_state"))
+        threads = self.threads or fallback.n_threads()
+        oofs, tests = [], []
+        for seed in range(self.seeds):
+            left = _left(deadline)
+            if left <= 0:
+                raise TimeoutError("screening stopped: no time left")
+            stop_at = time.monotonic() + (left / (self.seeds - seed) if math.isfinite(left) else 1e9)
+            extra = {**(getattr(run, "extra", None) or {}), "n_estimators": self.rounds,
+                     "learning_rate": self.learning_rate, **fallback.seed_params(run.model, ctx.config.seed + seed)}
+            fitted = fallback.cv_model(data, f"screen_{run.name}", run.model, ctx.config, stop_at,
+                                       transform=run.transform, extra=extra, threads=threads, entity=run.entity,
+                                       early_stopping=0, max_train_rows=self.max_rows, **args)
+            oofs.append(fitted.oof)
+            tests.append(fitted.test_pred)
+        oof, test_pred = sum(oofs) / len(oofs), sum(tests) / len(tests)
+        scores = [float(s) for s in fallback._fold_scores(data, oof)]
+        return Candidate(name="agent_screen", cv_score=float(np.mean(scores)), cv_std=float(np.std(scores)),
+                         oof=oof, test_pred=test_pred,
+                         meta={"fold_scores": scores, "fold_ids": data.folds, "new_columns": new,
+                               "evaluator": "screen", "screen": self.name, "classes": data.classes})
+
+
+def _greater(metric: str) -> bool:
+    team = _team_metrics()
+    try:
+        return bool(team.greater_is_better(metric)) if team is not None else metric_name(metric) not in _LOWER
+    except Exception:
+        return metric_name(metric) not in _LOWER
+
+
+_LOWER = ("rmse", "mse", "mae", "rmsle", "mape", "logloss")
+
+
+# ============================================================ сигналы для планировщика
+
+def _raw_name(column: str, renamed: dict) -> str:
+    """Имя исходной колонки train.csv для колонки матрицы fallback (безопасные имена, производные «col__freq»)."""
+    return str(renamed.get(column, column)).split("__")[0]
+
+
+def _by_raw(values: dict, renamed: dict) -> dict:
+    out: dict[str, float] = {}
+    for col, value in values.items():
+        raw = _raw_name(col, renamed)
+        out[raw] = out.get(raw, 0.0) + float(value)
+    return out
+
+
+def _gain_importance(x: pd.DataFrame, y: np.ndarray, task: str, threads: int, rounds: int, seed: int) -> dict:
+    import lightgbm as lgb
+
+    cls = lgb.LGBMRegressor if task == "regression" else lgb.LGBMClassifier
+    model = cls(n_estimators=rounds, learning_rate=0.05, num_leaves=63, subsample=0.8, subsample_freq=1,
+                colsample_bytree=0.8, importance_type="gain", random_state=seed, n_jobs=threads, verbose=-1)
+    model.fit(x, y)
+    total = float(np.sum(model.feature_importances_)) or 1.0
+    return {c: float(v) / total for c, v in zip(x.columns, model.feature_importances_)}
+
+
+def recipe_signals(recipe: RecipeEvaluator, *, threads: int | None = None, rounds: int = 200,
+                   max_rows: int = 100_000, top: int = 10, max_chars: int = 1600) -> str:
+    """Что уже делает лучший кандидат fallback и где сигнал — текст для планировщика агента (только агрегаты).
+
+    - модели и веса рецепта, схема CV (новый период в test / группы дублей), исключённые колонки, признаки сущности;
+    - что уже построено предобработкой: частотное кодирование, части дат, TF-IDF текста, удалённые колонки;
+    - важность признаков (gain одного LightGBM на матрице fallback, по исходным колонкам);
+    - дрейф train → test: AUC классификатора «строка из test?» и колонки, по которым он отличает test.
+    Без этого LLM предлагала то, что уже есть (частотное кодирование), и не знала, какие колонки нестабильны.
+    """
+    import fallback
+
+    ctx = recipe.ctx
+    data, report = ctx.data, ctx.data.prep.report
+    renamed = report.get("renamed", {})
+    threads = threads or recipe.threads or fallback.n_threads()
+    lines = ["Baseline models (blend weights): "
+             + ", ".join(f"{name} {weight:.2f}" for name, weight in recipe.members.items())]
+    scheme = data.cv_scheme or {}
+    if scheme.get("kind") == "period":
+        lines.append(f"CV folds are whole periods of {scheme.get('column')}; test is a NEW period "
+                     f"{scheme.get('test_levels')}: features must generalize to an unseen period.")
+    elif scheme.get("kind") == "duplicates":
+        lines.append("CV keeps identical rows in one fold (test rows rarely have exact twins in train): "
+                     "memorizing duplicates does not help.")
+    runs = [recipe.runs[name] for name in recipe.members]
+    excluded = sorted({_raw_name(c, renamed) for r in runs for c in r.exclude})
+    if excluded:
+        lines.append(f"Excluded from all models (hurt CV): {', '.join(excluded)}.")
+    if data.entity is not None and any(r.entity for r in runs):
+        key = ", ".join(map(str, data.entity.get("columns", [])))
+        static = ", ".join(map(str, data.entity.get("static") or []))
+        lines.append(f"Already features: target mean/median/count of the same entity in other rows (key {key}"
+                     + (f"; refined by {static}" if static else "") + "). Do not rebuild them.")
+    freq = sorted({_raw_name(c, renamed) for c in data.prep.X.columns if str(renamed.get(c, c)).endswith("__freq")})
+    if freq:
+        lines.append(f"Already features: frequency encoding of {', '.join(freq)}.")
+    if report.get("dates"):
+        lines.append("Already features: year/month/day/weekday/day-of-year/hour/timestamp of "
+                     f"{', '.join(report['dates'])}.")
+    if report.get("text"):
+        lines.append(f"Already features: text length and TF-IDF SVD of {', '.join(report['text'])}.")
+    if report.get("dropped"):
+        lines.append("Dropped by preprocessing: " + ", ".join(f"{c} ({r})" for c, r in
+                                                             list(report["dropped"].items())[:8]) + ".")
+
+    try:
+        x, x_test, _ = ctx.data.frame("lightgbm")
+        drop = [c for r in runs for c in r.exclude if c in x.columns]
+        x, x_test = x.drop(columns=drop), x_test.drop(columns=drop)
+        rng = np.random.default_rng(0)
+        rows = rng.choice(len(x), min(len(x), max_rows), replace=False)
+        y = np.log1p(data.y) if data.task == "regression" and runs[0].transform == "log1p" else data.y
+        share = _by_raw(_gain_importance(x.iloc[rows], y[rows], data.task, threads, rounds, 0), renamed)
+        ranked = sorted(share.items(), key=lambda kv: -kv[1])
+        lines.append("Feature importance (gain share): "
+                     + ", ".join(f"{c} {100 * v:.1f}%" for c, v in ranked[:top]) + ".")
+        weak = [c for c, v in ranked if v < 0.002]
+        if weak:
+            lines.append(f"Almost unused by the model: {', '.join(weak[:top])}.")
+
+        both = pd.concat([x.iloc[rows], x_test.iloc[rng.choice(len(x_test), min(len(x_test), max_rows),
+                                                               replace=False)]], ignore_index=True)
+        is_test = np.r_[np.zeros(len(rows)), np.ones(len(both) - len(rows))]
+        period = scheme.get("column") if scheme.get("kind") == "period" else None
+        both = both.drop(columns=[c for c in both.columns if _raw_name(c, renamed) == period])
+        auc, drift = _adversarial(both, is_test, threads, rounds)
+        drift_raw = sorted(_by_raw(drift, renamed).items(), key=lambda kv: -kv[1])
+        if auc >= 0.6:
+            lines.append(f"Train/test drift: a model tells test rows from train with AUC {auc:.2f}"
+                         + (f" (without {period})" if period else "") + "; most different: "
+                         + ", ".join(f"{c} {100 * v:.0f}%" for c, v in drift_raw[:8])
+                         + ". Raw values of drifting columns generalize poorly: prefer ratios or values relative "
+                           "to a group/period.")
+        else:
+            lines.append(f"Train/test drift is small (AUC {auc:.2f}).")
+    except Exception as error:  # сигналы — подсказка, без них агент работает как раньше
+        lines.append(f"(feature importance / drift unavailable: {type(error).__name__})")
+    text = "\n".join(f"- {line}" for line in lines)
+    return text if len(text) <= max_chars else text[:max_chars - 20] + "...[truncated]"
+
+
+def _adversarial(x: pd.DataFrame, is_test: np.ndarray, threads: int, rounds: int) -> tuple[float, dict]:
+    """AUC «строка из test?» на отложенной четверти и доли gain колонок этого классификатора."""
+    import lightgbm as lgb
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import train_test_split
+
+    tr, va = train_test_split(np.arange(len(x)), test_size=0.25, random_state=0, stratify=is_test)
+    model = lgb.LGBMClassifier(n_estimators=rounds, learning_rate=0.05, num_leaves=31, subsample=0.8,
+                               subsample_freq=1, colsample_bytree=0.8, importance_type="gain", random_state=0,
+                               n_jobs=threads, verbose=-1)
+    model.fit(x.iloc[tr], is_test[tr])
+    auc = float(roc_auc_score(is_test[va], model.predict_proba(x.iloc[va])[:, 1]))
+    total = float(np.sum(model.feature_importances_)) or 1.0
+    return auc, {c: float(v) / total for c, v in zip(x.columns, model.feature_importances_)}

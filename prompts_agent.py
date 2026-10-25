@@ -21,9 +21,20 @@ TUNE_KIND = "tune"  # подбор гиперпараметров тюнером
 TUNE_KIND_LINE = ("- tune: automatic hyperparameter search for the current model on the current features "
                   "(no code is written; title like \"Tune lightgbm hyperparameters\"); best after features stop improving")
 MODEL_SEARCH_KIND = "model_search"  # сравнить все бустинги на текущих признаках тем же evaluator, без кодера
-RECIPE_KINDS = ("features", "encoding", "missing")  # режим «поверх fallback»: только новые колонки
-RECIPE_RULE = ("A strong baseline (preprocessing, models, their blend, class weights) is fixed: an experiment may "
-               "only ADD new columns; changing or dropping existing columns has no effect.")
+ACTION_KINDS = ("drop", "weights", "target_stats")  # действия над рецептом: исполняет харнесс, LLM пишет JSON
+RECIPE_KINDS = ("features", "encoding", "missing", *ACTION_KINDS)  # режим «поверх fallback»
+RECIPE_RULE = ("A strong baseline (preprocessing, models, their blend, class weights) is fixed; feature experiments "
+               "only ADD new columns (at most 8), changing existing columns in code has no effect; the TOOLS "
+               "drop / weights / target_stats change the baseline itself. Read \"Baseline facts\": never rebuild "
+               "what it already has; use importance and drift to choose.")
+RECIPE_TOOLS = (
+    "- drop (tool): exclude raw columns from all models, e.g. strongly drifting ones; "
+    "\"action\": {\"drop\": [\"col\", ...]} (<= 10)\n"
+    "- weights (tool): training row weights; \"action\": {\"scheme\": \"dedup\" | \"recency\" | \"class\", "
+    "\"power\": 0.5..2} (dedup — duplicated train rows absent in test; recency — test is a new period; class — "
+    "class imbalance)\n"
+    "- target_stats (tool): out-of-fold target statistics per key, leak-free (mean/count; class shares); "
+    "\"action\": {\"keys\": [[\"col_a\", \"col_b\"]]} (1-2 keys of 1-3 categorical or id-like columns)")
 MODEL_SEARCH_KIND_LINE = ("- model_search: compare lightgbm, catboost and xgboost on the current features, keep the "
                           "best (no code; title like \"Compare boosting models\")")
 
@@ -38,7 +49,7 @@ PLAN_SCHEMA = {
                 "type": "object",
                 "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "kind": {"type": "string"},
                                "rationale": {"type": "string"}, "expected_gain": {"type": "string"},
-                               "cost": {"type": "string"}},
+                               "cost": {"type": "string"}, "action": {"type": "object"}},
                 "required": ["title"],
             },
         },
@@ -153,6 +164,8 @@ Rules:
 - Trees are invariant to monotonic transforms of one feature (log, sqrt, scaling, rank) and handle NaN \
 natively: such changes and plain median/mean imputation give zero gain. Prefer interactions, ratios, \
 differences, group statistics and counts across rows, which trees cannot build themselves.
+- Use the domain meaning of columns (notes): physical rates and per-unit quantities, differences of related \
+columns, a value relative to its group mean. Avoid blind products of unrelated columns.
 - The target is NOT available to feature code: no target encoding, no target statistics.
 - No external data or pretrained models (text: TF-IDF + SVD); never use row order or row index as a feature.
 - Do not repeat what the memory says was already tried.
@@ -234,28 +247,47 @@ def _hypothesis_text(hypothesis: dict) -> str:
 
 
 _PLANNER_INTRO = "with fixed K-fold CV. Each experiment changes ONE thing in the current best solution"
+_NO_TARGET_RULE = "- The target is NOT available to feature code: no target encoding, no target statistics."
 _RECIPE_DROP_KINDS = ("- outliers:", "- target_transform:", "relative error, so it suits", "- params:", "- model:",
                       "- feature_selection:")
-assert _PLANNER_INTRO in PLANNER_SYSTEM
+assert _PLANNER_INTRO in PLANNER_SYSTEM and _NO_TARGET_RULE in PLANNER_SYSTEM
 
 
 def _recipe_planner(system: str) -> str:
-    """Планировщик «поверх fallback»: без видов гипотез про модель/параметры/удаление, с правилом про новые колонки."""
-    lines = [line for line in system.split("\n") if not line.startswith(_RECIPE_DROP_KINDS)]
-    return "\n".join(lines).replace("\nRules:\n", f"\nRules:\n- {RECIPE_RULE}\n", 1)
+    """Планировщик «поверх fallback»: без видов про модель/параметры, с инструментами рецепта и правилом рецепта."""
+    lines = []
+    for line in system.split("\n"):
+        if line.startswith(_RECIPE_DROP_KINDS):
+            continue
+        lines.append(line)
+        if line.startswith("- missing:"):
+            lines.append(RECIPE_TOOLS)
+    text = "\n".join(lines).replace("\nRules:\n", f"\nRules:\n- {RECIPE_RULE}\n", 1)
+    text = text.replace(_NO_TARGET_RULE, "- The target is NOT available to feature code; for target statistics use the "
+                                         "target_stats tool (computed leak-free by the harness).", 1)
+    return text.replace('"cost": "low|mid|high"}]}', '"cost": "low|mid|high", "action": {...} (tools only)}]}', 1)
 
 
 def build_plan_messages(*, task_line: str, task_text: str, profile: str, base_code: str, cv_text: str,
                         memory: str, n: int = 6, task_chars: int = 1200, profile_chars: int = 5000,
                         code_chars: int = 2000, memory_chars: int = 1500, errors: str = "",
                         errors_chars: int = 800, can_tune: bool = False,
-                        can_search_models: bool = False, recipe: bool = False) -> list[dict]:
+                        can_search_models: bool = False, recipe: bool = False, signals: str = "",
+                        signals_chars: int = 1600, retry: int = 0) -> list[dict]:
+    if signals:  # сигналы рецепта дороже длинного профиля: профиль ужимается, чтобы вызов остался в бюджете
+        profile_chars = min(profile_chars, 2800)
     user = (f"## Task\n{task_line}\n{clip(task_text, task_chars)}\n\n"
             f"## Data profile\n{clip(profile, profile_chars)}\n\n"
-            f"## Current best solution ({cv_text})\n```python\n{clip(base_code, code_chars)}\n```\n\n"
+            + (f"## Baseline facts (what the fixed baseline already does) and signals\n"
+               f"{clip(signals, signals_chars)}\n\n" if signals else "")
+            + f"## Current best solution ({cv_text})\n```python\n{clip(base_code, code_chars)}\n```\n\n"
             + (f"## Where the current model errs\n{clip(errors, errors_chars)}\n\n" if errors else "")
             + f"## Memory\n{clip(memory, memory_chars)}\n\n"
-            f"Propose up to {n} new hypotheses as ONE JSON object.")
+            + (f"Attempt {retry + 1}: your previous plan only repeated ideas from Memory. Propose clearly "
+               "DIFFERENT directions: columns no experiment has used yet, other operations (group statistics, "
+               "differences of related columns, counts, ranks within a group), other combinations of strong "
+               "columns.\n" if retry else "")
+            + f"Propose up to {n} new hypotheses as ONE JSON object.")
     system = PLANNER_SYSTEM.format(n=n)
     if recipe:
         system = _recipe_planner(system)
