@@ -116,6 +116,15 @@ def _fit_predict(job: dict) -> dict:
     return out
 
 
+def available() -> bool:
+    """Установлен ли AutoGluon (без импорта: сам импорт — только в процессе-воркере)."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec("autogluon.tabular") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def _command(job_path: Path) -> list[str]:
     return [sys.executable, str(Path(__file__).resolve()), str(job_path)]
 
@@ -140,6 +149,9 @@ def run(spec: Any, best: Any, deadline: Any = None, *, seconds: float = 2400.0, 
     budget = min(float(seconds), _left(deadline) - RESERVE)
     if budget < MIN_SECONDS:
         log.info("automl: нет времени (%.0f с) — пропуск", budget)
+        return []
+    if not available():
+        log.warning("automl: AutoGluon (autogluon.tabular) не установлен — пропуск")
         return []
     root = Path(workdir) if workdir is not None else Path(spec.task_dir) / ".agent_work" / "automl"
     try:

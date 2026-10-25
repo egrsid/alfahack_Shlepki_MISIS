@@ -152,3 +152,9 @@ def test_automl_budget_leaves_window_for_agent(monkeypatch):
     assert solution.automl_seconds(deadline(research=10_000), with_agent=True) == 2400
     monkeypatch.setenv("SOLUTION_AUTOML_SECONDS", "0")
     assert solution.automl_seconds(deadline(), with_agent=False) == 0
+
+
+def test_environment_is_logged(caplog):
+    with caplog.at_level(logging.INFO):
+        found = solution.log_environment()
+    assert found["lightgbm"] and "окружение: Python" in caplog.text and set(found) == set(solution.OPTIONAL_PACKAGES)

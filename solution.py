@@ -198,11 +198,32 @@ def understand(task_path: Path, client: Any) -> Any:
         return fallback.guess_spec(task_path)
 
 
+OPTIONAL_PACKAGES = ("lightgbm", "xgboost", "catboost", "sklearn", "optuna", "autogluon.tabular", "torch", "openai",
+                     "psutil", "pyarrow", "fastparquet")
+
+
+def log_environment() -> dict[str, bool]:
+    """Какие пакеты есть в окружении (без импорта): по логу платформы видно, чего не хватило."""
+    import importlib.util
+
+    found = {}
+    for name in OPTIONAL_PACKAGES:
+        try:
+            found[name] = importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            found[name] = False
+    log.info("окружение: Python %s; есть: %s; нет: %s", sys.version.split()[0],
+             ", ".join(n for n, ok in found.items() if ok) or "—",
+             ", ".join(n for n, ok in found.items() if not ok) or "—")
+    return found
+
+
 def solve(task_path: str | Path, *, llm: Any = "auto", deadline: Deadline | None = None,
           agent_config: Any = None) -> list[str]:
     """Весь запуск; возвращает проблемы записанного submission.csv (пусто — файл в порядке)."""
     start = time.monotonic()
     task_path = Path(task_path).resolve()
+    log_environment()
     if deadline is None:
         research_end = float(os.environ.get("SOLUTION_RESEARCH_END", RESEARCH_END))
         deadline = Deadline(start, TOTAL_SECONDS, research_end)

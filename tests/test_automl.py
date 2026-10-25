@@ -77,3 +77,10 @@ def test_hanging_worker_is_killed(tmp_path, monkeypatch):
 def test_no_pretrained_or_missing_models():
     config = automl._hyperparameters()
     assert not {"TABPFN", "TABPFNMIX", "FASTAI", "FT_TRANSFORMER"} & set(config) and {"GBM", "NN_TORCH"} <= set(config)
+
+
+def test_missing_autogluon_is_skipped_without_worker(tmp_path, monkeypatch):
+    spec = make_regression_task(tmp_path / "reg")
+    monkeypatch.setattr(automl, "available", lambda: False)
+    monkeypatch.setattr(automl, "_command", lambda job: pytest.fail("worker must not start"))
+    assert automl.run(spec, fallback_like(spec, np.arange(400) % 4), seconds=120) == []
