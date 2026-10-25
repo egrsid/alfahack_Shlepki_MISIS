@@ -87,6 +87,7 @@ class FallbackConfig:
     # похожие классы (DoS/Backdoor/Analysis). Оценка пропорций всё равно считается и пишется в meta как диагностика.
     label_shift: bool = False
     job_cap_units: float = 4.0       # потолок времени на модель после первой: N × время первого LightGBM
+    entity: bool = True              # признаки по таргету повторяющейся сущности (регрессия/бинарная), берутся по CV
     decision_seconds: float = 40.0
     write: bool = True
     threads: int | None = None
@@ -232,6 +233,8 @@ class TaskData:
     label_shift: dict | None = None                # оценка пропорций классов в test (detect_label_shift)
     shift_weights: np.ndarray | None = None        # π_test(y)/π_train(y) для строк train, если сдвиг применяется
     rows: np.ndarray | None = None                 # позиции строк train.csv, участвующих в обучении (None — все)
+    entity: dict | None = None                     # ключ «сущности» (find_entity) для признаков по её таргету
+    period_order: np.ndarray | None = None         # порядок периода строки train (для «только прошлое»)
     frames: dict[str, tuple[pd.DataFrame, pd.DataFrame, list[str]]] = field(default_factory=dict)
 
     def frame(self, model: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
@@ -288,6 +291,70 @@ def duplicate_stats(train_x: pd.DataFrame, test_x: pd.DataFrame) -> tuple[np.nda
     dup_share = float(pd.Series(h_train).duplicated(keep=False).mean()) if len(h_train) else 0.0
     twin_share = float(np.isin(h_test, h_train).mean()) if len(h_test) else 0.0
     return groups, dup_share, twin_share
+
+
+def identity_columns(train_x: pd.DataFrame, test_x: pd.DataFrame, exclude: set) -> list[str]:
+    """Колонки-«идентичности» сущности: много уникальных значений, и у ≥ 30% строк test точное значение встречается
+    в train редко (1–10 раз) — та же сущность в другой строке. Пример: floor_area здания (одно здание — разные годы)."""
+    found = []
+    for col in train_x.columns:
+        if col in exclude or col not in test_x.columns:
+            continue
+        a = train_x[col]
+        if a.nunique() < max(100, 0.01 * len(a)):  # мало уровней — это свойство, а не идентичность
+            continue
+        if test_x[col].map(a.value_counts()).between(1, 10).mean() >= 0.3:
+            found.append(col)
+    return found
+
+
+def find_entity(train_x: pd.DataFrame, test_x: pd.DataFrame, exclude: set) -> dict | None:
+    """Ключ сущности = колонки-идентичности + категориальные колонки (≤ 200 уровней). None — сущностей нет."""
+    identity = identity_columns(train_x, test_x, exclude)
+    if not identity:
+        return None
+    cats = [c for c in train_x.columns if c not in identity and c not in exclude
+            and not pd.api.types.is_numeric_dtype(train_x[c]) and train_x[c].nunique() <= 200]
+    cols = identity + cats
+    key_train = pd.util.hash_pandas_object(train_x[cols].astype(str), index=False).to_numpy()
+    key_test = pd.util.hash_pandas_object(test_x[cols].astype(str), index=False).to_numpy()
+    return {"columns": cols, "identity": identity, "test_known": round(float(np.isin(key_test, key_train).mean()), 4),
+            "key_train": key_train, "key_test": key_test}
+
+
+ENTITY_FEATURES = ("entity__mean", "entity__count", "entity__median")
+
+
+def _entity_stats(key_src: np.ndarray, y_src: np.ndarray, key_dst: np.ndarray) -> np.ndarray:
+    if not len(key_src):
+        return np.column_stack([np.full(len(key_dst), np.nan), np.zeros(len(key_dst)), np.full(len(key_dst), np.nan)])
+    table = pd.DataFrame({"k": key_src, "y": y_src}).groupby("k", sort=False)["y"].agg(["mean", "count", "median"])
+    out = table.reindex(key_dst).to_numpy(dtype=float)
+    out[:, 1] = np.nan_to_num(out[:, 1])
+    return out
+
+
+def entity_features(data: "TaskData", train_idx: np.ndarray, valid_idx: np.ndarray
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Среднее/число/медиана таргета той же сущности — без утечки: своя строка и валидационный фолд не участвуют.
+
+    Есть порядок периодов (test — новый период): каждая строка видит только более ранние периоды, как test.
+    Иначе — вложенный out-of-fold: строка обучающего фолда j видит остальные обучающие фолды.
+    """
+    key, y, order = data.entity["key_train"], data.y, data.period_order
+    groups = order if order is not None else data.folds
+    feat_tr = np.zeros((len(train_idx), len(ENTITY_FEATURES)))
+    for g in np.unique(groups[train_idx]):
+        rows = train_idx[groups[train_idx] == g]
+        src = train_idx[groups[train_idx] < g] if order is not None else train_idx[groups[train_idx] != g]
+        feat_tr[np.searchsorted(train_idx, rows)] = _entity_stats(key[src], y[src], key[rows])
+    feat_va = np.zeros((len(valid_idx), len(ENTITY_FEATURES)))
+    for g in np.unique(groups[valid_idx]):
+        rows = valid_idx[groups[valid_idx] == g]
+        src = train_idx[groups[train_idx] < g] if order is not None else train_idx
+        feat_va[np.searchsorted(valid_idx, rows)] = _entity_stats(key[src], y[src], key[rows])
+    feat_te = _entity_stats(key[train_idx], y[train_idx], data.entity["key_test"])  # для test весь train — прошлое
+    return feat_tr, feat_va, feat_te
 
 
 def choose_cv(train_x: pd.DataFrame, test_x: pd.DataFrame, y: np.ndarray, task: str, n_splits: int,
@@ -378,7 +445,23 @@ def load(spec: Any, cfg: FallbackConfig) -> TaskData:
         folds, scheme, period_feature = make_folds(y, task, n_splits, cfg.seed), {"kind": "random"}, None
     log.info("схема CV: %s", scheme)
     rows = None if keep.all() else np.flatnonzero(keep)
-    return TaskData(spec, task, metric, y, classes, prep, folds, n_splits, scheme, period_feature, rows=rows)
+    period_order, entity = None, None
+    if scheme.get("kind") == "period":
+        column = scheme["column"]
+        if column in train.columns:
+            period_order = pd.to_numeric(train[column], errors="coerce").fillna(-np.inf).to_numpy()
+        elif column in prep.X.columns:  # дата: те же интервалы времени, что и фолды
+            period_order = pd.qcut(prep.X[column].rank(method="first"), n_splits, labels=False).fillna(0).to_numpy()
+    if cfg.entity and task in ("regression", "binary"):
+        try:
+            entity = find_entity(train[features], test[features], {scheme.get("column")})
+        except Exception as error:  # noqa: BLE001 — признаки сущности необязательны
+            log.warning("поиск сущности пропущен: %s", error)
+        if entity is not None:
+            log.info("сущность: ключ %s (идентичности %s), в test узнаётся %.1f%% строк", entity["columns"],
+                     entity["identity"], 100 * entity["test_known"])
+    return TaskData(spec, task, metric, y, classes, prep, folds, n_splits, scheme, period_feature, rows=rows,
+                    entity=entity, period_order=period_order)
 
 
 def cv_folds(spec: Any, config: FallbackConfig | None = None) -> tuple[np.ndarray, np.ndarray | None, dict]:
@@ -522,6 +605,7 @@ class Run:
     transform: str | None
     iterations: list[int]
     exclude: tuple[str, ...] = ()
+    entity: bool = False
 
     @property
     def cv(self) -> float:
@@ -530,8 +614,11 @@ class Run:
 
 def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at: float, *,
              transform: str | None = None, extra: dict | None = None, threads: int = 1,
-             exclude: tuple[str, ...] = ()) -> Run:
-    """K-fold с фиксированными фолдами: OOF, среднее по фолдам на test, оценка metrics.score на каждом фолде."""
+             exclude: tuple[str, ...] = (), entity: bool = False) -> Run:
+    """K-fold с фиксированными фолдами: OOF, среднее по фолдам на test, оценка metrics.score на каждом фолде.
+
+    entity — добавить признаки по таргету той же сущности (entity_features), считаются внутри каждого фолда.
+    """
     start = time.monotonic()
     regression = data.task == "regression"
     x, x_test, cats = data.frame(model)
@@ -550,9 +637,15 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
         y_tr = data.y[train_idx]
         if transform == "log1p":
             y_tr = np.log1p(y_tr)
+        x_tr, x_va, x_te = x.iloc[train_idx], x.iloc[valid_idx], x_test
+        if entity and data.entity is not None:
+            e_tr, e_va, e_te = entity_features(data, train_idx, valid_idx)
+            x_tr = x_tr.assign(**dict(zip(ENTITY_FEATURES, e_tr.T)))
+            x_va = x_va.assign(**dict(zip(ENTITY_FEATURES, e_va.T)))
+            x_te = x_te.assign(**dict(zip(ENTITY_FEATURES, e_te.T)))
         p_va, p_te, iters, present = _fit_predict(
-            model, regression, params, x.iloc[train_idx], y_tr, x.iloc[valid_idx],
-            np.log1p(data.y[valid_idx]) if transform == "log1p" else data.y[valid_idx], x_test, cats, fold_stop,
+            model, regression, params, x_tr, y_tr, x_va,
+            np.log1p(data.y[valid_idx]) if transform == "log1p" else data.y[valid_idx], x_te, cats, fold_stop,
             cfg.early_stopping)
         if regression:
             if transform == "log1p":
@@ -569,7 +662,7 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
         scores.append(metrics.score(data.metric, data.y[valid_idx], oof[valid_idx]))
         iterations.append(iters)
     return Run(name, model, oof, test_pred, scores, time.monotonic() - start, params, transform, iterations,
-               tuple(exclude))
+               tuple(exclude), bool(entity and data.entity is not None))
 
 
 # ---------------------------------------------------------------- бленд и кандидаты
@@ -747,6 +840,7 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
     best: Candidate | None = None
     transform: str | None = None
     excluded: tuple[str, ...] = ()  # признаки, исключённые по CV (колонка-период)
+    use_entity = False              # признаки сущности приняты по CV
     unit: float | None = None  # секунд на «единицу» LightGBM — для оценки остальных моделей
 
     def left() -> float:
@@ -780,11 +874,11 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
                 data.label_shift = {"used": False, "error": str(error)[:200]}
         consider(f"fallback_{result.name}", result.oof, result.test_pred, result.fold_scores,
                  {"model": result.model, "params": result.params, "target_transform": result.transform,
-                  "excluded": list(result.exclude), "iterations": result.iterations,
+                  "excluded": list(result.exclude), "entity": result.entity, "iterations": result.iterations,
                   "seconds": round(result.seconds, 1)})
 
     def attempt(name: str, model: str, extra: dict, tf: str | None, share: float,
-                exclude: tuple[str, ...] = ()) -> Run | None:
+                exclude: tuple[str, ...] = (), entity: bool | None = None) -> Run | None:
         tail = 15.0 + decision_seconds
         if unit is not None and unit * _COST.get(model, 1.0) > 1.5 * max(0.0, left() - tail):
             log.info("%s пропущен: оценка %.0f с, осталось %.0f с", name, unit * _COST.get(model, 1.0), left())
@@ -797,7 +891,7 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
         stop_at = time.monotonic() + window
         try:
             result = cv_model(data, name, model, cfg, stop_at, transform=tf, extra=extra, threads=threads,
-                              exclude=exclude)
+                              exclude=exclude, entity=use_entity if entity is None else entity)
         except Exception as error:  # noqa: BLE001 — сбой одной модели не роняет остальные
             log.warning("%s упал: %s: %s", name, type(error).__name__, str(error)[:300])
             return None
@@ -821,6 +915,13 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
                 if metrics.is_better(data.metric, without.cv, result.cv):
                     excluded, result = (data.period_feature,), without
                     log.info("без %s лучше по CV — остальные модели учатся без него", data.period_feature)
+        if model == "lightgbm" and not extra and data.entity is not None and not use_entity:
+            with_entity = attempt("lightgbm_entity", "lightgbm", {}, transform, 0.5, excluded, entity=True)
+            if with_entity is not None:
+                accept(with_entity)
+                if metrics.is_better(data.metric, with_entity.cv, result.cv):
+                    use_entity, result = True, with_entity
+                    log.info("признаки сущности лучше по CV — остальные модели учатся с ними")
         if (model == "lightgbm" and not extra and data.task == "regression" and transform is None
                 and cfg.try_log_target and data.y.min() >= 0
                 and (data.metric in ("rmsle", "msle", "mape") or pd.Series(data.y).skew() > 0.75)):
@@ -850,6 +951,8 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
         writer.offer(best)
     best.meta.update(seconds=round(time.monotonic() - start, 1), preprocess=data.prep.report,
                      label_shift=data.label_shift,
+                     entity_key=None if data.entity is None else {k: data.entity[k] for k in ("columns", "identity",
+                                                                                               "test_known")},
                      runs=[{"name": r.name, "cv": r.cv, "std": float(np.std(r.fold_scores)),
                             "seconds": round(r.seconds, 1)} for r in runs])
     log.info("fallback готов за %.0f с: %s cv=%.6g (с порогом/весами: %.6g)", time.monotonic() - start, best.name,
