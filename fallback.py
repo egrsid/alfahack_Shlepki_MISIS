@@ -200,7 +200,8 @@ def guess_spec(task_path: str | Path) -> Any:
     train_cols = list(pd.read_csv(submission.task_file(probe, "train.csv"), nrows=0).columns)
     test_cols = list(pd.read_csv(submission.task_file(probe, "test.csv"), nrows=0).columns)
 
-    id_col = sample_cols[0] if sample_cols[0] in test_cols and len(sample_cols) > 1 else None
+    # id — колонка образца, которая есть в test (обычно первая; бывает «target,id» — тогда без него не пишется ничего)
+    id_col = next((c for c in sample_cols if c in test_cols), None) if len(sample_cols) > 1 else None
     targets = [c for c in sample_cols if c != id_col and c in train_cols and c not in test_cols]
     if not targets:  # имя таргета в образце другое — берём колонки train, которых нет в test
         targets = [c for c in train_cols if c not in test_cols and c != id_col][:max(1, len(sample_cols) - 1)]
