@@ -1513,6 +1513,13 @@ class _Research:
         except Exception as error:  # постобработка — бонус, а не обязательный шаг
             log.warning("research: postprocess failed: %s: %s", type(error).__name__, P.clip(str(error), 300))
 
+    def _bag_seconds(self) -> float:
+        """Оценка доводки лучшего до сидов fallback (finalize); 0 — доводить нечего или она выключена."""
+        seeds = int(getattr(self.evaluate, "bag_seeds", 1) or 1)
+        if not self.cfg.bag_best or not self.recipe or seeds <= 1 or not self.accepted:
+            return 0.0
+        return (seeds - 1) * self.reference_seconds * 1.25
+
     def _holdout_check(self) -> None:
         """Конец исследования: принятые шаги остаются, только если улучшают и скрытый фолд (против эталона рецепта).
 
@@ -1559,7 +1566,7 @@ class _Research:
                 or not any(c is current for c in self.accepted) or (current.meta or {}).get("bagged_seeds")):
             return
         deadline = _FinalDeadline(self.deadline, cfg.final_reserve_seconds)
-        need = (seeds - 1) * self.reference_seconds * 1.25
+        need = self._bag_seconds()
         if need > deadline.left():
             log.info("research: bagging of %s skipped: needs ~%.0fs, %.0fs left before the final reserve",
                      current.name, need, deadline.left())
@@ -1723,6 +1730,12 @@ class _Research:
         left, need = self._left(), self._expected_seconds()
         if left < need:
             return f"time: {left:.0f}s left, an iteration needs ~{need:.0f}s"
+        bag_need = self._bag_seconds()
+        if bag_need > 0:  # уже есть что доводить до сидов fallback: итерация не должна съесть время доводки
+            final_left = _FinalDeadline(self.deadline, cfg.final_reserve_seconds).left()
+            if final_left - need < bag_need:
+                return (f"time: {final_left:.0f}s left before the final reserve, an iteration (~{need:.0f}s) and "
+                        f"bagging of the best (~{bag_need:.0f}s) do not fit")
         if self.tokens_used() >= cfg.max_tokens:
             return f"tokens: {self.tokens_used()} >= {cfg.max_tokens}"
         if self.consecutive_failures >= cfg.max_consecutive_failures:

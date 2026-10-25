@@ -98,7 +98,9 @@ def blended(tmp_path, monkeypatch):
     spec, _ = regression_task(tmp_path / "reg", n_train=500, n_test=150)
     monkeypatch.setattr(fallback, "clearly_better",
                         lambda metric, new, old, k=1.0: new.name == "fallback_blend" and "_bag" not in old.name)
-    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm", "xgboost"), try_log_target=False))
+    # без потолка «N × время первой модели»: под нагрузкой таймер обрезал бы сид bag3, и сравнение с bag() — нечестное
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm", "xgboost"), try_log_target=False,
+                                                            job_cap_units=1e6))
     monkeypatch.undo()
     assert best.name == "fallback_blend_bag3" and best.meta.get("honest")
     return spec, best

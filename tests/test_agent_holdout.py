@@ -89,3 +89,18 @@ def test_real_improvement_survives_hidden_fold(tmp_path, caplog):
                                 config=agent.AgentConfig(**{**FAST, "max_iters": 1}))
     assert result and experiments(spec)[0]["status"] == "accepted"
     assert "hidden fold 4: agent_01_features" in caplog.text and "→ kept" in caplog.text
+
+
+def test_iteration_does_not_eat_time_reserved_for_bagging():
+    loop = research_stub()
+    loop.evaluate = types.SimpleNamespace(bag_seeds=3)
+    loop.reference_seconds, loop.iteration, loop.durations = 100.0, 0, []
+    loop.tokens_in = loop.tokens_out = loop.consecutive_failures = loop.no_improve = 0
+    loop.cfg = agent.AgentConfig(llm_reserve_seconds=0, final_reserve_seconds=600)
+    loop.deadline = SimpleDeadline(1000)  # окно research = общий остаток: после запаса 600 с — ~400 с
+    loop.accepted = []
+    assert loop._stop_reason() == ""  # доводить нечего — итерация (~125 с) влезает
+    loop.accepted = [cand([9.0] * 5)]  # доводка ~250 с + итерация ~125 с ≤ 400 с
+    assert loop._stop_reason() == ""
+    loop.reference_seconds = 150.0  # доводка ~375 с + итерация ~188 с > 400 с
+    assert loop._stop_reason().startswith("time:") and "bagging of the best" in loop._stop_reason()
