@@ -2114,6 +2114,7 @@ class _Research:
         self.iteration += 1
         n = self.iteration
         self.screen_decision = None
+        self.filter_notes = []  # заметки фильтра колонок — только этого эксперимента (не тянуть из прошлого)
         start, tokens_in, tokens_out = time.monotonic(), self.tokens_in, self.tokens_out
         status, error, digest = "failed", "", ""
         base_code, last_code = self.base_code, None  # база до эксперимента: _judge её заменит при принятии

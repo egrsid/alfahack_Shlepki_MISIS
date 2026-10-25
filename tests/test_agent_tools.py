@@ -116,3 +116,18 @@ def test_big_task_screen_subsamples_rows_and_uses_one_seed(task):
     cand = screen(spec, identity_features, {"recipe_state": {"drop": ["x3"]}})
     assert np.isfinite(cand.cv_score)
     assert agent_eval.ScreenEvaluator(recipe).max_rows is None  # маленькая задача — все строки
+
+
+def test_filter_notes_do_not_leak_into_the_next_experiment(task):
+    spec, best = task
+    ratio = 'df["x1_x2"] = df["x1"] * df["x2"]; df["x1_x2_copy"] = df["x1"] * df["x2"] * 2'
+    from mocks import feature_code, fenced, plan
+    llm = MockLLM({"planner": [plan("Product x1*x2")], "coder": [fenced(feature_code(ratio))]})
+    evaluate = agent_eval.RecipeEvaluator(best, threads=2)
+    action = {"title": "Drop x3", "kind": "drop", "rationale": "-", "action": {"drop": ["x3"]}}
+    llm.script["planner"].append({"analysis": "-", "hypotheses": [action]})
+    agent.research(spec, best, llm, SimpleDeadline(1200), evaluate=evaluate,
+                   config=agent.AgentConfig(**{**FAST, "max_iters": 2, "screen": False}))
+    rows = experiments(spec)
+    assert "duplicates" in rows[0]["error"] and rows[1]["kind"] == "drop"
+    assert "duplicates" not in rows[1]["error"]
