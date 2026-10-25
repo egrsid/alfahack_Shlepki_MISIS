@@ -16,12 +16,13 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# точка входа, модули команды (P2 llm_client, P3 fallback/preprocess/metrics/submission, P5 sandbox) и агент (P4)
+# точка входа, модули команды (P2 llm_client, P3 fallback/preprocess/metrics/submission, P5 sandbox), агент (P4)
+# и модули ролей P1/P2/P5, написанные P4 (tuning, ensemble, task_understanding, guards)
 FILES = ("solution.py", "requirements.txt",
          "fallback.py", "preprocess.py", "metrics.py", "submission.py",
          "llm_client.py", "sandbox.py",
          "agent.py", "agent_eval.py", "prompts_agent.py", "memory.py", "error_analysis.py", "postprocess.py",
-         "tuning.py")
+         "tuning.py", "ensemble.py", "task_understanding.py", "guards.py")
 SECRET = re.compile(r"sk-[A-Za-z0-9_-]{16,}|/Users/|/home/[a-z]")
 MAX_BYTES = 100 * 1024 * 1024
 

@@ -1,9 +1,11 @@
 """Решение: python3 solution.py task.md → submission.csv рядом с task.md.
 
+0. понимание задачи (task_understanding): эвристики по файлам + проверенные подсказки LLM (метрика, даты, текст).
 1. fallback (P3): spec по файлам задачи, честная схема CV (периоды / группы дублей), бустинги, бленд, веса классов.
    submission.csv пишется сразу (константа), затем после каждой лучшей модели.
-2. агент (P4): LLM-цикл гипотез (признаки, выбор модели, постобработка) на ТЕХ ЖЕ фолдах, что у fallback.
-   Его кандидат пишется, только если по парным фолдам он лучше fallback больше шума.
+2. агент (P4): LLM-цикл гипотез (признаки, выбор модели, подбор параметров, постобработка) на ТЕХ ЖЕ фолдах,
+   что у fallback; затем бленд «fallback + агент» (ensemble). Пишется лучший из кандидатов агента и бленда,
+   только если по парным фолдам он лучше fallback больше шума и прошёл guards (сверка test-прогноза с fallback).
 3. проверка записанного файла; если он испорчен — переписывается кандидатом fallback.
 
 Любой сбой агента или LLM оставляет сабмит fallback. Ключ и адрес LLM — только из переменных окружения
@@ -23,6 +25,7 @@ from typing import Any
 import pandas as pd
 
 import fallback
+import metrics
 import submission
 
 log = logging.getLogger("solution")
@@ -89,51 +92,80 @@ def make_llm(task_dir: Path) -> Any:
 
 
 def agent_spec(spec: Any) -> Any:
-    """Копия spec для агента: заметки по колонкам из data_dictionary.csv и строковые колонки как категории."""
+    """Копия spec для агента: заметки по колонкам (data_dictionary.csv) и все строковые колонки как категории."""
+    import task_understanding
+
     spec = copy.copy(spec)
+    if not getattr(spec, "feature_notes", None):
+        spec.feature_notes = task_understanding.read_dictionary(spec)
     try:
-        notes: dict[str, str] = {}
-        dictionary = pd.read_csv(submission.task_file(spec, "data_dictionary.csv"))
-        name_col = next((c for c in dictionary.columns if str(c).lower() in ("feature", "name", "column", "field")),
-                        dictionary.columns[0])
-        desc_col = next((c for c in dictionary.columns if "desc" in str(c).lower()), dictionary.columns[-1])
-        unit_col = next((c for c in dictionary.columns if str(c).lower() == "unit"), None)
-        for _, row in dictionary.iterrows():
-            note = str(row[desc_col])
-            if unit_col is not None and pd.notna(row[unit_col]):
-                note += f" [{row[unit_col]}]"
-            notes[str(row[name_col])] = note
-        spec.feature_notes = {**notes, **(getattr(spec, "feature_notes", None) or {})}
-    except Exception as error:  # словаря может не быть или формат другой
-        log.info("data_dictionary.csv не прочитан: %s", error)
-    if not getattr(spec, "cat_cols", None):
-        try:
-            head = pd.read_csv(submission.task_file(spec, "train.csv"), nrows=2000)
-            targets = submission.targets_of(spec)
-            spec.cat_cols = [c for c in head.columns
-                             if head[c].dtype == object and c not in targets and c != spec.id_col]
-        except Exception as error:
-            log.info("строковые колонки не определены: %s", error)
+        head = pd.read_csv(submission.task_file(spec, "train.csv"), nrows=2000)
+        skip = {*submission.targets_of(spec), spec.id_col, *(getattr(spec, "date_cols", None) or []),
+                *(getattr(spec, "text_cols", None) or [])}
+        strings = [c for c in head.columns if head[c].dtype == object and c not in skip]
+        spec.cat_cols = list(dict.fromkeys([*(getattr(spec, "cat_cols", None) or []), *strings]))
+    except Exception as error:
+        log.info("строковые колонки не определены: %s", error)
     return spec
 
 
-def run_agent(spec: Any, best: Any, llm: Any, deadline: Deadline, config: Any = None) -> Any | None:
-    """Лучший кандидат агента, если он честно лучше fallback (те же фолды, выигрыш больше шума), иначе None."""
+def run_agent(spec: Any, best: Any, llm: Any, deadline: Deadline, config: Any = None) -> list:
+    """Кандидаты агента по убыванию CV — на тех же фолдах и строках train, что у fallback."""
     import agent
 
     meta = getattr(best, "meta", None) or {}
     evaluate = agent._optional("evaluator", "evaluate") or agent.LocalEvaluator(
         folds=meta.get("folds"), rows=meta.get("train_rows"), early_stopping=100)  # фолды и модели как у fallback
-    found = agent.research(agent_spec(spec), best, llm, deadline, config=config, evaluate=evaluate)
-    for cand in found:  # по убыванию CV
-        if fallback.clearly_better(spec.metric, cand, best):
-            log.info("агент: %s cv=%.6g лучше fallback (%.6g) больше шума", cand.name, cand.cv_score,
-                     fallback.effective_cv(best))
-            return cand
+    return agent.research(agent_spec(spec), best, llm, deadline, config=config, evaluate=evaluate)
+
+
+def suspicious(spec: Any, cand: Any, best: Any) -> list[str]:
+    """Проблемы кандидата по guards.check_candidate против fallback (пусто — можно писать)."""
+    try:
+        import guards
+        problems = guards.check_candidate(spec, cand, best)
+    except Exception:
+        log.exception("guards упали — кандидат %s не проверен", cand.name)
+        return []
+    if problems:
+        log.warning("guards: %s отклонён: %s", cand.name, "; ".join(problems))
+    return problems
+
+
+def pick(spec: Any, best: Any, found: list) -> Any | None:
+    """Что записать вместо fallback: лучший по CV из кандидатов агента и бленда «fallback + агент» (ensemble),
+    если он честно лучше fallback (парные фолды, выигрыш больше шума); иначе None — остаётся fallback."""
+    options = list(found)
     if found:
-        log.info("агент: лучший кандидат %s cv=%.6g не лучше fallback (%.6g) больше шума — остаётся fallback",
-                 found[0].name, found[0].cv_score, fallback.effective_cv(best))
-    return None
+        try:
+            import ensemble
+            mixed = ensemble.blend(spec, [best, *found])
+            if mixed is not None:
+                options.append(mixed)
+        except Exception:
+            log.exception("бленд fallback + агент не собран")
+    good = [c for c in options if fallback.clearly_better(spec.metric, c, best) and not suspicious(spec, c, best)]
+    if not good:
+        if options:
+            top = options[0]
+            log.info("агент: лучший кандидат %s cv=%.6g не лучше fallback (%.6g) больше шума — остаётся fallback",
+                     top.name, fallback.effective_cv(top), fallback.effective_cv(best))
+        return None
+    sign = 1.0 if metrics.greater_is_better(spec.metric) else -1.0
+    winner = max(good, key=lambda c: sign * fallback.effective_cv(c))
+    log.info("агент: %s cv=%.6g лучше fallback (%.6g) больше шума", winner.name, fallback.effective_cv(winner),
+             fallback.effective_cv(best))
+    return winner
+
+
+def understand(task_path: Path, client: Any) -> Any:
+    """spec задачи: task_understanding (эвристики + проверенный ответ LLM), при сбое — эвристики fallback."""
+    try:
+        import task_understanding
+        return task_understanding.understand_task(task_path, client)
+    except Exception:
+        log.exception("понимание задачи упало — эвристики fallback")
+        return fallback.guess_spec(task_path)
 
 
 def solve(task_path: str | Path, *, llm: Any = "auto", deadline: Deadline | None = None,
@@ -144,7 +176,12 @@ def solve(task_path: str | Path, *, llm: Any = "auto", deadline: Deadline | None
     if deadline is None:
         research_end = float(os.environ.get("SOLUTION_RESEARCH_END", RESEARCH_END))
         deadline = Deadline(start, TOTAL_SECONDS, research_end)
-    spec = fallback.guess_spec(task_path)
+    client = None
+    try:
+        client = make_llm(task_path.parent) if llm == "auto" else llm
+    except Exception:
+        log.exception("клиент LLM не создан — только fallback")
+    spec = understand(task_path, client)
     multi = isinstance(spec.target, list)
 
     best = None
@@ -156,12 +193,11 @@ def solve(task_path: str | Path, *, llm: Any = "auto", deadline: Deadline | None
 
     if best is not None and not multi and deadline.stage("research") > 0:
         try:
-            client = make_llm(Path(spec.task_dir)) if llm == "auto" else llm
             if agent_config is None and os.environ.get("SOLUTION_AGENT_ITERS"):  # только для локальных проверок
                 import agent
                 agent_config = agent.AgentConfig(max_iters=int(os.environ["SOLUTION_AGENT_ITERS"]))
             if client is not None:
-                winner = run_agent(spec, best, client, deadline, agent_config)
+                winner = pick(spec, best, run_agent(spec, best, client, deadline, agent_config))
                 if winner is not None:
                     submission.write_candidate(spec, winner)
                     log.info("submission.csv ← агент (%s)", winner.name)

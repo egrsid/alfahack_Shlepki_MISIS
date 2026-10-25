@@ -67,7 +67,7 @@ def test_no_research_window_skips_agent(tmp_path):
     spec = make_regression_task(tmp_path / "reg")
     llm = MockLLM()
     assert solution.solve(spec.task_dir / "task.md", llm=llm, deadline=deadline(research=0)) == []
-    assert llm.calls == []
+    assert [role for role, _, _ in llm.calls] == ["task_analyst"]  # только понимание задачи, агент не запускался
 
 
 class FakeClient:
