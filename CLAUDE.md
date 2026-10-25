@@ -64,7 +64,7 @@ print(response.choices[0].message.content)
 - Команда запуска на платформе: `python3 solution.py task.md`. Скрипт работает в одной папке с `task.md`
   (текстовое описание задачи). Итоговый `submission.csv` сохранять **туда же, рядом с `task.md`**.
 - Промежуточные файлы можно создавать в каталоге задачи, в его подкаталогах и в `/tmp`.
-- Интерфейс (переменные окружения, расположение данных, формат вывода) также зафиксирован в `baseline.py` — сверяться с ним.
+- Интерфейс (переменные окружения, расположение данных, формат вывода) также зафиксирован в `tools/baseline.py` — сверяться с ним.
 - Проверка идёт в системе Boosters: статус «Решение находится на проверке» значит только «в очереди». После проверки — «Точность вычисления: …» или ошибка.
 - Частые ошибки: «Превышено время обработки» (3 часа, включая запросы к LLM); «Не хватает данных в решении: отсутствует файл …»
   (нет `submission.csv` рядом с `task.md`); «Ошибка формата данных» (формат сабмита не как в `sample_submission.csv`).
@@ -213,7 +213,7 @@ class Candidate:
 - Сообщение в чат команды при мердже в `main`: что изменилось и нужно ли всем сделать `git pull --rebase`.
 
 ### Этапы и порядок мержей
-**Этап 0 — старт (все, ~1–2 ч).** P1: скелет + `schemas.py` + `budget.py`-заглушка → в `main`. Все: клонируют, создают `.venv` на Python 3.12 из `requirements.txt`, кладут свой `.env`, прогоняют `python3 solution.py task.md` на обеих public-задачах (папки `Регрессия/`, `Многоклассовая классификация/` лежат локально, в git не идут). P2: `check_llm.py` — убедиться, что LLM отвечает.
+**Этап 0 — старт (все, ~1–2 ч).** P1: скелет + `schemas.py` + `budget.py`-заглушка → в `main`. Все: клонируют, создают `.venv` на Python 3.12 из `requirements.txt`, кладут свой `.env`, прогоняют `python3 solution.py task.md` на обеих public-задачах (папки `Регрессия/`, `Многоклассовая классификация/` лежат локально, в git не идут). P2: `tools/check_llm.py` — убедиться, что LLM отвечает.
 **Этап 1 — параллельно (ветки независимы):** P2 `llm-client`, P3 `fallback-pipeline` + `metrics-submission`, P4 `agent-loop` на заглушках LLM/песочницы (мок-клиент), P5 `sandbox` + `test-datasets`, P1 `time-budget` + `evaluator-harness` + `eda-profile` + интеграционный каркас `solution.py` (P4 до мержа харнесса работает с интерфейсом `evaluator.evaluate` и заглушкой). Порядок мержа: `skeleton` → `evaluator-harness`, `metrics-submission`, `llm-client`, `sandbox` (они почти ни от кого не зависят) → `fallback-pipeline`, `task-understanding` → `agent-loop`.
 **Этап 2 — первая работающая версия:** P1 собирает `solution.py` из мерженных модулей, прогон на public-задачах и на датасетах P5, **первый сабмит** (fallback + понимание задачи, без цикла) → записать score как точку отсчёта.
 **Этап 3 — AutoResearch и качество:** `agent-loop` + `guards-validation` в `main`, `tuning`, `final-ensemble` (P1), `experiment-memory`, `agent-strategies` (P4). Контроль бюджета LLM (₽/день общий — договариваться, кто когда гоняет). Сабмит №2 с агентом, сравнение с первым.
@@ -233,8 +233,29 @@ class Candidate:
 - Скрытые задачи могут быть другого типа (бинарная с AUC, MAE, текст в колонках) → не подгонять под две public-задачи, смотреть на набор P5.
 - Утечки и переобучение на CV из-за множества гипотез → фиксированные сплиты, порог улучшения > шума, финальная проверка на отложенной части, которую агент не видит.
 
+## Структура репозитория (сводка; подробно — `README.md`)
+- **Корень = ровно содержимое ZIP**: `solution.py`, `requirements.txt` и плоские модули решения. Вспомогательное в корень
+  не класть (платформа копирует все корневые `.py`): организаторский `baseline.py` и `check_llm.py` — в `tools/`.
+- `tools/` — вне ZIP: `make_zip.py` (сборка из корня по списку `FILES` + проверки `package.py`, `--smoke`),
+  `package.py` (P3: сборка из распакованного архива с подменой модулей), `make_datasets.py` + `run_all.py`
+  (12 тестовых задач и прогон ZIP на них), `try_agent.py` (короткий прогон агента), `baseline.py`, `check_llm.py`.
+- `tests/` — pytest всех модулей, без LLM (`LLM_DISABLED=1`, MockLLM). `docs/plans/<ветка>.md` — план и итоги каждой ветки,
+  `docs/plans/integration-submission.md` — как собрано решение и замеры, `docs/submissions.md` — таблица сабмитов.
+- Конвейер `solution.py`: понимание задачи (`task_understanding`) → `fallback` (P3) → AutoGluon (`automl`, до 40 мин, на
+  тех же фолдах) → агент (`agent`, стартует с лучшего кандидата fallback и добавляет признаки) → бленды (`ensemble`) →
+  запись только при честном выигрыше над уже записанным и после `guards` → проверка файла.
+
 ## Статус
-- Начало работы: проверка зависимостей, окружения, среды.
-- Инструкция по ключам получена, ключ выдан команде; модель и base URL известны (см. выше).
-- В репозитории есть `solution.py` v0 (LightGBM без LLM, без CV) и `check_llm.py` (smoke-тест LLM) — стартовые точки для P3 и P2.
-- План работы на 5 человек составлен (см. выше). Следующий шаг: P1 заводит `feature/skeleton-contracts`, остальные создают свои ветки.
+- 2026-10-25: все ветки объединены в `main` (через `integration/submission`): P2 `llm_client`, P3 fallback/metrics/
+  preprocess/submission (по `53cbbde`), P4 агент (`feature/agent-loop` → `experiment-memory` → `agent-strategies` →
+  `agent-models`), P5 `sandbox`. Модулей P1 (`schemas`, `evaluator`, `budget`, `tuning`, `ensemble`), P2
+  (`task_understanding`) и P5 (`guards`, тестовые датасеты) не было — `tuning.py`, `ensemble.py`, `task_understanding.py`,
+  `guards.py`, `automl.py`, `tools/make_datasets.py`, `tools/run_all.py` и черновик `solution.py` написал P4 по контрактам
+  выше; владельцы могут переписать. `schemas.py`/`evaluator.py`/`budget.py` заменены: duck typing по атрибутам,
+  `agent_eval.LocalEvaluator`/`RecipeEvaluator` на фолдах fallback, `solution.Deadline`.
+- Сабмиты на платформу (2 шт., P4): обе задачи завершились; агент на одной остановился из-за отсутствия pyarrow на платформе —
+  исправлено (обмен с песочницей без parquet). Таблица — `docs/submissions.md`.
+- Проверено без LLM: все тесты (`pytest tests/`), 12 тестовых задач + 2 public через ZIP в чистой папке — корректный файл.
+  Не проверено: живой прогон агента с Qwen внутри ZIP локально, Docker без сети.
+- Следующее: живой короткий прогон агента; оценка агента по 3 сидам (fallback усредняет 3 сида); решить, сколько времени
+  отдавать AutoGluon (на public он слабее fallback: P3 на отложенной части 0.578 против 0.661).

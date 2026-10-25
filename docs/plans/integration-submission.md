@@ -1,0 +1,119 @@
+# Ветка `integration/submission` — сборка сабмита из веток команды (P4, @egrsid)
+
+> Локальная ветка интеграции: `feature/agent-models` (P4) + `origin/main` (P5 `sandbox.py`) +
+> `origin/feature/fallback-pipeline` (P3, включает `metrics-submission`, по `1cde55c`) + `origin/feature/llm-client` (P2).
+> Модулей P1 (`tuning`, `ensemble`, `solution.py`), P2 (`task_understanding`) и P5 (`guards`, тестовые задачи) ни в
+> одной ветке не было — они написаны здесь P4, **владельцы могут переписать** (контракты — из плана команды в `main`).
+
+## Что в ZIP (`tools/make_zip.py` → `dist/solution_<коммит>.zip`, ~125 КБ, 19 файлов в корне)
+
+| Файл | Владелец | Роль |
+|---|---|---|
+| `solution.py` | P1 (черновик P4) | точка входа: понимание задачи → fallback → AutoGluon → агент → бленды → guards → проверка файла |
+| `fallback.py`, `preprocess.py`, `metrics.py`, `submission.py` | P3 | честная схема CV, бустинги, бленд, веса классов, запись и проверка сабмита |
+| `llm_client.py` | P2 | клиент Qwen: ретраи, кэш, учёт токенов, бюджет → `LLMUnavailable` |
+| `task_understanding.py` | P2 (написано P4) | `understand_task`: эвристики + проверенные подсказки LLM |
+| `sandbox.py` | P5 | песочница для кода LLM |
+| `guards.py` | P5 (написано P4) | `check_candidate`: сверка кандидата с fallback перед записью |
+| `tuning.py` | P1 (написано P4) | `tune`: optuna по контракту агента |
+| `ensemble.py` | P1 (написано P4) | `blend`: Caruana по OOF пула (модели fallback, AutoGluon, агент), честная оценка по чужим фолдам |
+| `automl.py` | P1/P3 (написано P4) | AutoGluon на фолдах fallback в отдельном процессе |
+| `agent.py`, `agent_eval.py`, `prompts_agent.py`, `memory.py`, `error_analysis.py`, `postprocess.py` | P4 | агент |
+| `requirements.txt` | P1 | зависимости платформы (не менялся) |
+
+## Как работает `solution.py`
+
+0. LLM-клиент (если есть `OPENAI_API_KEY` и не `LLM_DISABLED=1`) → `task_understanding.understand_task`:
+   `fallback.guess_spec` (таргет и id — из образца, метрика — из `task.md`) + заметки `data_dictionary.csv` + один
+   короткий запрос к LLM. Из ответа берётся только проверенное по данным: метрика (лишь если в `task.md` её не нашли),
+   колонки дат (парсятся ≥ 90%), текста (длина ≥ 20, ≥ 3 слов), строковых категорий, утечек (≤ 3 и упомянуты в
+   `task.md`). Любая ошибка — эвристики.
+1. `fallback.run(spec, deadline)`: сабмит-константа сразу, потом после каждой лучшей модели (бюджет fallback — 900 с).
+   В `meta["context"]` — рецепт лучшего кандидата (матрицы, фолды, все модели, веса членов), `fallback.pool` —
+   кандидат на каждую модель.
+2. AutoGluon (`automl.run`, до 40 мин, оставляет агенту ≥ 15 мин): сырые признаки + колонка фолда →
+   `TabularPredictor(groups=...)` учится ровно на фолдах fallback; без стэкинга, без TabPFN; в отдельном процессе
+   (torch рядом с уже обученными LightGBM/XGBoost зависал). Затем `improve`: бленд «все модели fallback + AutoGluon».
+3. Агент (окно — до T+2ч30): **стартует с лучшего кандидата fallback** — `RecipeEvaluator` переобучает члены его
+   рецепта на тех же матрицах + новые колонки кода LLM, с теми же весами и честным порогом/весами классов.
+   Виды гипотез — только новые колонки (features/encoding/missing); модели, параметры и веса классов — у рецепта.
+   Затем `improve`: бленд «модели fallback + AutoGluon + агент».
+3½. `improve` после шагов 2 и 3: пишется лучший из кандидатов и бленда (`ensemble.blend`, честная оценка: веса
+   фолда подбираются на остальных фолдах), только если он `clearly_better` **уже записанного** и прошёл `guards`.
+4. `submission.check_file`; испорчен — переписывается кандидатом fallback, в крайнем случае константой.
+
+## Проверено
+
+- Все тесты вместе без LLM (P2, P3, P4, P5, `test_solution`, `test_tuning`, `test_ensemble`, `test_task_understanding`,
+  `test_guards`, `test_automl`, `test_agent_recipe`, `test_agent_frames`). Тесты агента изолированы от настоящего
+  `tuning.py`, тесты `solution` — от AutoGluon, кроме явных (conftest, `SOLUTION_AUTOML_SECONDS`).
+- **Без pyarrow/fastparquet** (ответ организаторов после двух сабмитов: «на одной из задач исследовательский процесс
+  остановился из-за отсутствия pyarrow или fastparquet»): обмен таблицами агента с песочницей переведён с parquet на
+  свой формат (`agent.FRAME_IO`: `.npy` + JSON, без pickle). Проверено: тест с отключённым pyarrow и dry-run агента на
+  public-мультиклассе (87 670 строк) с заглушкой `import pyarrow → ImportError` — цикл прошёл, гипотеза принята.
+  AutoGluon без pyarrow тоже работает (проверено). При старте `solution.py` пишет в лог, каких пакетов нет.
+- `tools/make_datasets.py` + `tools/run_all.py`: 12 синтетических задач + 2 public, ZIP распакован в чистую папку,
+  `python3 solution.py task.md` без LLM — **14/14 корректный файл**, все лучше константы (таблица в «Статусе»).
+
+## Как проверить самому
+
+```sh
+.venv/bin/python tools/make_zip.py                                        # собрать
+.venv/bin/python tools/make_datasets.py                                   # задачи → .agent_work/datasets/
+# public-задачи в тот же формат (ответов нет — только проверка файла):
+mkdir -p .agent_work/datasets/public_reg/task .agent_work/datasets/public_cls/task
+cp Регрессия/{*.csv,task.md} .agent_work/datasets/public_reg/task/
+cp "Многоклассовая классификация"/{*.csv,task.md} .agent_work/datasets/public_cls/task/
+.venv/bin/python tools/run_all.py dist/solution_<коммит>.zip              # без LLM, ~20 мин
+# короткий живой прогон агента (тратит общий бюджет): ключ в окружении, 4 итерации, окно до T+25 мин
+set -a; source .env; set +a
+SOLUTION_AGENT_ITERS=4 SOLUTION_RESEARCH_END=1500 \
+  .venv/bin/python tools/run_all.py dist/solution_<коммит>.zip --only public_reg,public_cls --llm
+# логи: .agent_work/runs/<задача>/run.log
+```
+
+## Известные ограничения
+
+- Живой прогон агента с Qwen внутри ZIP локально не делался (ключ только в `.env`; команда — выше). На платформе
+  агент запускался (сабмиты P4) и остановился на parquet — исправлено, см. «Проверено».
+- Docker-проверка (Linux, `--network none`) не делалась — Docker не установлен; остаётся за P5.
+- Мульти-таргет — только fallback (`run_multi`), агент и понимание задачи через LLM пропускаются.
+- `tuning` выбирает параметры на тех же фолдах, на которых агент их потом оценивает, — оценка оптимистична;
+  защита — правило принятия по парным фолдам и `clearly_better` в `solution.py`.
+- `ensemble` теперь оценивается честно (веса фолда — по остальным фолдам), а лучший кандидат fallback — нет (его бленд
+  и пороги подобраны на тех же OOF): сравнение «бленд vs fallback» консервативно, бленд пишется реже, чем мог бы.
+- AutoGluon получает сырые признаки, без признаков сущности fallback: на public-регрессии он слабее (45.0 против 41.4).
+- Шаг агента в режиме «поверх fallback» = переобучение членов рецепта: на мультиклассе ~2–4 мин на гипотезу.
+- `guards` сверяет с fallback, а не с ответами: при сильном сдвиге train/test честный кандидат тоже может
+  отличаться от fallback; пороги консервативные (TV долей классов 0.2, корреляция регрессии 0.5).
+
+## Статус
+
+Прогон ZIP `3699e62` **без LLM** (`tools/run_all.py`, Mac, 10 потоков):
+
+| задача | метрика | время | итог | константа |
+|---|---|---|---|---|
+| public регрессия | RMSE ↓ (CV) | 174 с | **41.37** (было 43.29: признаки сущности P3 `a594aea`) | — |
+| public мультикласс | Macro F1 ↑ (CV) | 560 с | **0.649** (бленд + веса классов) | — |
+| bin_auc (рак груди) | ROC-AUC ↑ | 4 с | 0.9985 | 0.5 |
+| bin_f1_str (таргет yes/no, 9:1) | F1 ↑ | 6 с | 0.769 | 0 |
+| digits_weighted (10 классов) | weighted F1 ↑ | 93 с | 0.979 | 0.015 |
+| multi_imbalance (6 классов, 100:1, 800 уровней) | Macro F1 ↑ | 78 с | 0.824 | 0.118 |
+| multi_target (2 таргета) | RMSE ↓ | 21 с | 25.2 | 150.1 |
+| reg_mae_en (442 строки, англ.) | MAE ↓ | 2 с | 43.7 | 65.1 |
+| reg_mape_period (новый год в test) | MAPE ↓ | 15 с | 0.048 | 0.097 |
+| reg_no_id (без id) | R² ↑ | 12 с | 0.983 | 0.0 |
+| reg_rmsle_skewed (дата, текст, пропуски) | RMSLE ↓ | 14 с | 0.338 | 0.782 |
+| small_wine (178 строк, без словаря) | accuracy ↑ | 7 с | 0.979 | 0.447 |
+| text_cls (свободный текст) | accuracy ↑ | 7 с | 0.900 | 0.509 |
+| wide_logloss (300 признаков) | logloss ↓ | 84 с | 0.204 | 0.693 |
+
+Прогон ZIP `79c1137` (+ AutoGluon) **без LLM**, `SOLUTION_AUTOML_SECONDS=300` (локально 5 мин; на платформе — 40):
+
+| задача | fallback | AutoGluon (лучшая модель) | честный бленд всего | записано |
+|---|---|---|---|---|
+| public регрессия, RMSE ↓ | 41.37 (xgboost) | 45.04 (WeightedEnsemble) | 41.62 | fallback — бленд не лучше |
+| public мультикласс, Macro F1 ↑ | 0.649 (бленд + веса классов) | 0.596 (WeightedEnsemble) | 0.644 | fallback — бленд не лучше |
+
+За 5 минут AutoGluon не успел обучить нейросеть (в лидерборде её нет); на платформе бюджет в 8 раз больше.
+Время: регрессия 538 с, мультикласс 1055 с. Агент с живым Qwen локально не запускался; с MockLLM — тесты.
