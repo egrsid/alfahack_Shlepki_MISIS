@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import make_zip  # noqa: E402
 
-CFG = agent.AgentConfig(**FAST)
+CFG = agent.AgentConfig(**FAST, auto_tune=False)  # правило записи проверяется без настоящего подбора (tuning.py)
 
 
 def deadline(research: float = 600) -> solution.Deadline:

@@ -188,8 +188,9 @@ class LocalEvaluator:
 
     def __init__(self, n_splits: int = 5, seed: int = 42, n_estimators: int = 300,
                  learning_rate: float = 0.05, threads: int | None = None, *, folds: Any = None,
-                 rows: Any = None, early_stopping: int = 0) -> None:
+                 rows: Any = None, early_stopping: int = 0, max_folds: int | None = None) -> None:
         self.n_splits, self.seed, self.early_stopping = n_splits, seed, early_stopping
+        self.max_folds = max_folds  # оценка только на первых фолдах тех же сплитов (быстрый подбор в tuning.py)
         self.n_estimators, self.learning_rate = n_estimators, learning_rate
         self.threads = threads or os.cpu_count() or 4
         self.folds = None if folds is None else np.asarray(folds, dtype=int)
@@ -218,10 +219,13 @@ class LocalEvaluator:
         if self.folds is not None:
             if len(self.folds) != len(x):
                 raise ValueError(f"folds cover {len(self.folds)} rows, train has {len(x)}")
-            return [(np.flatnonzero(self.folds != f), np.flatnonzero(self.folds == f)) for f in np.unique(self.folds)]
-        from sklearn.model_selection import KFold, StratifiedKFold
-        splitter = (KFold if regression else StratifiedKFold)(self.n_splits, shuffle=True, random_state=self.seed)
-        return list(splitter.split(x, y))
+            splits = [(np.flatnonzero(self.folds != f), np.flatnonzero(self.folds == f))
+                      for f in np.unique(self.folds)]
+        else:
+            from sklearn.model_selection import KFold, StratifiedKFold
+            splitter = (KFold if regression else StratifiedKFold)(self.n_splits, shuffle=True, random_state=self.seed)
+            splits = list(splitter.split(x, y))
+        return splits[:self.max_folds] if self.max_folds else splits
 
     def _load(self, spec: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
         key = str(spec.task_dir)

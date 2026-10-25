@@ -63,7 +63,7 @@ EvaluateFn = Callable[[Any, Callable, dict, Any], Candidate]
 RunCodeFn = Callable[[str, Path, float], Any]
 # guards.check_candidate(spec, cand, baseline) -> list[str], пусто = ок  (P5)
 GuardFn = Callable[[Any, Candidate, Candidate], list]
-# tuning.tune(spec, build_features, cfg, deadline) -> dict гиперпараметров  (P1; заглушка — ветка stub/p1-tuning)
+# tuning.tune(spec, build_features, cfg, deadline) -> dict гиперпараметров  (P1; tuning.py)
 TuneFn = Callable[[Any, Callable, dict, Any], dict]
 
 
@@ -1698,7 +1698,8 @@ class _Research:
         if budget < cfg.tune_min_seconds:
             return None, f"tuning: only {budget:.0f}s available"
         settings = {"model": model, "params": dict(params), "target_transform": transform,
-                    "n_trials": cfg.tune_trials, "seed": cfg.tune_seed}
+                    "n_trials": cfg.tune_trials, "seed": cfg.tune_seed,
+                    "evaluate": self.evaluate}  # подбор на тех же фолдах и тем же обучением, что оценка агента
         start = time.monotonic()
         try:
             found = self.tuner(self.spec, make_build_features(features.x_train, features.x_test), settings,

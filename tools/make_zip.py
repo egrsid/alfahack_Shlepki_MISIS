@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FILES = ("solution.py", "requirements.txt",
          "fallback.py", "preprocess.py", "metrics.py", "submission.py",
          "llm_client.py", "sandbox.py",
-         "agent.py", "agent_eval.py", "prompts_agent.py", "memory.py", "error_analysis.py", "postprocess.py")
+         "agent.py", "agent_eval.py", "prompts_agent.py", "memory.py", "error_analysis.py", "postprocess.py",
+         "tuning.py")
 SECRET = re.compile(r"sk-[A-Za-z0-9_-]{16,}|/Users/|/home/[a-z]")
 MAX_BYTES = 100 * 1024 * 1024
 
