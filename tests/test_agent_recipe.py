@@ -11,7 +11,8 @@ from mocks import GOOD_CODE, MockLLM, SimpleDeadline, fenced, identity_features,
 from test_agent_loop import FAST, experiments
 
 # fallback из одного LightGBM без лог-таргета: признак x1*x2 он сам не построит — новая колонка честно помогает
-ONE = fallback.FallbackConfig(models=("lightgbm",), try_log_target=False)
+# bag_seeds=1: рецепт переобучает один сид — сравниваем с fallback того же сида
+ONE = fallback.FallbackConfig(models=("lightgbm",), try_log_target=False, bag_seeds=1)
 
 
 @pytest.fixture
@@ -71,3 +72,20 @@ def test_agent_starts_from_fallback_and_adds_columns(task):
     coder = [m for role, m, _ in llm.calls if role == "coder"][0]
     assert "PARAMS = {" not in coder[0]["content"] and "only new column names" in coder[0]["content"]
     assert all(r["kind"] in P.RECIPE_KINDS for r in rows)  # гипотеза params отброшена
+
+
+def test_bagged_and_randomforest_members_are_resolved(tmp_path):
+    spec = make_regression_task(tmp_path / "reg", n_train=500)
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm", "randomforest"), try_log_target=False))
+    ctx = best.meta["context"]
+    assert ctx.members and set(ctx.members) <= {r.name for r in ctx.runs}  # в т.ч. fallback_<имя>_bag3
+    evaluate = agent_eval.RecipeEvaluator(best, threads=2)
+    cand = evaluate(spec, with_columns(x1_x2=lambda f: f["x1"] * f["x2"], city2=lambda f: f["city"] + "_"))
+    assert np.isfinite(cand.cv_score) and cand.meta["new_columns"] == ["x1_x2", "city2"]
+
+    forest = fallback.run(spec, None, fallback.FallbackConfig(models=("randomforest",), try_log_target=False,
+                                                              bag_seeds=1, entity=False))
+    assert list(forest.meta["context"].members) == ["randomforest"]
+    cand = agent_eval.RecipeEvaluator(forest, threads=2)(spec, with_columns(
+        ratio=lambda f: f["x1"] / f["x3"], city2=lambda f: f["city"] + "_"))  # NaN и категория → числа для sklearn
+    assert np.isfinite(cand.cv_score)

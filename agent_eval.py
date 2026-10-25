@@ -421,8 +421,12 @@ class RecipeEvaluator:
             add_tr, add_te = extra_tr, extra_te
             if key == "catboost" and cat_new:
                 add_tr, add_te = add_tr.astype({c: str for c in cat_new}), add_te.astype({c: str for c in cat_new})
+            elif key == "randomforest":  # sklearn: только числа, пропуски — отдельным значением (как у fallback)
+                add_tr, add_te = (frame.apply(lambda c: c.cat.codes.where(c.notna()) if c.name in cat_new else c)
+                                  .astype("float32").fillna(-999.0) for frame in (add_tr, add_te))
             data.frames[key] = (pd.concat([x.reset_index(drop=True), add_tr], axis=1),
-                                pd.concat([x_test.reset_index(drop=True), add_te], axis=1), [*cats, *cat_new])
+                                pd.concat([x_test.reset_index(drop=True), add_te], axis=1),
+                                cats if key == "randomforest" else [*cats, *cat_new])
 
         threads = self.threads or fallback.n_threads()
         oof = test_pred = None
@@ -433,7 +437,8 @@ class RecipeEvaluator:
                 raise TimeoutError(f"evaluation stopped before member {name}")
             stop_at = time.monotonic() + (left / (len(self.members) - i) if math.isfinite(left) else 1e9)
             fitted = fallback.cv_model(data, name, run.model, ctx.config, stop_at, transform=run.transform,
-                                       extra=dict(run.params), threads=threads, exclude=run.exclude,
+                                       extra=dict(getattr(run, "extra", None) or {}), threads=threads,
+                                       exclude=run.exclude,
                                        entity=run.entity)
             oof = weight * fitted.oof if oof is None else oof + weight * fitted.oof
             test_pred = weight * fitted.test_pred if test_pred is None else test_pred + weight * fitted.test_pred

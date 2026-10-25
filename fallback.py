@@ -19,6 +19,7 @@ import copy
 import logging
 import math
 import os
+import re
 import sys
 import time
 import warnings
@@ -1060,10 +1061,10 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
                                                                                                "test_known")},
                      runs=[{"name": r.name, "cv": r.cv, "std": float(np.std(r.fold_scores)),
                             "seconds": round(r.seconds, 1)} for r in runs])
-    if best.meta.get("model") == "blend":
-        members = dict(best.meta.get("members") or {})
-    else:
-        members = {r.name: 1.0 for r in runs if f"fallback_{r.name}" == best.name}
+    members = dict(best.meta.get("members") or {})
+    if not members:  # одиночная модель, в том числе усреднённая по сидам (fallback_<имя>_bag3)
+        single = re.sub(r"_bag\d+$", "", best.name.removeprefix("fallback_"))
+        members = {r.name: 1.0 for r in runs if r.name == single}
     best.meta["context"] = FallbackContext(data, runs, cfg, members)  # для AutoML и агента; поведение не меняет
     log.info("fallback готов за %.0f с: %s cv=%.6g (с порогом/весами: %.6g)", time.monotonic() - start, best.name,
              best.cv_score, best.meta.get("cv_score_post", best.cv_score))
