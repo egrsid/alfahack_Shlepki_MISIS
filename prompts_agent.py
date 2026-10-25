@@ -23,7 +23,9 @@ TUNE_KIND_LINE = ("- tune: automatic hyperparameter search for the current model
 MODEL_SEARCH_KIND = "model_search"  # сравнить все бустинги на текущих признаках тем же evaluator, без кодера
 RECIPE_KINDS = ("features", "encoding", "missing")  # режим «поверх fallback»: только новые колонки
 RECIPE_RULE = ("A strong baseline (preprocessing, models, their blend, class weights) is fixed: an experiment may "
-               "only ADD new columns; changing or dropping existing columns has no effect.")
+               "only ADD new columns (at most 8); changing or dropping existing columns has no effect. Read "
+               "\"Baseline facts\": never rebuild what it already has; use importance to pick strong columns to "
+               "combine; for drifting columns prefer ratios or values relative to a group.")
 MODEL_SEARCH_KIND_LINE = ("- model_search: compare lightgbm, catboost and xgboost on the current features, keep the "
                           "best (no code; title like \"Compare boosting models\")")
 
@@ -153,6 +155,8 @@ Rules:
 - Trees are invariant to monotonic transforms of one feature (log, sqrt, scaling, rank) and handle NaN \
 natively: such changes and plain median/mean imputation give zero gain. Prefer interactions, ratios, \
 differences, group statistics and counts across rows, which trees cannot build themselves.
+- Use the domain meaning of columns (notes): physical rates and per-unit quantities, differences of related \
+columns, a value relative to its group mean. Avoid blind products of unrelated columns.
 - The target is NOT available to feature code: no target encoding, no target statistics.
 - No external data or pretrained models (text: TF-IDF + SVD); never use row order or row index as a feature.
 - Do not repeat what the memory says was already tried.
@@ -249,10 +253,15 @@ def build_plan_messages(*, task_line: str, task_text: str, profile: str, base_co
                         memory: str, n: int = 6, task_chars: int = 1200, profile_chars: int = 5000,
                         code_chars: int = 2000, memory_chars: int = 1500, errors: str = "",
                         errors_chars: int = 800, can_tune: bool = False,
-                        can_search_models: bool = False, recipe: bool = False) -> list[dict]:
+                        can_search_models: bool = False, recipe: bool = False, signals: str = "",
+                        signals_chars: int = 1600) -> list[dict]:
+    if signals:  # сигналы рецепта дороже длинного профиля: профиль ужимается, чтобы вызов остался в бюджете
+        profile_chars = min(profile_chars, 3400)
     user = (f"## Task\n{task_line}\n{clip(task_text, task_chars)}\n\n"
             f"## Data profile\n{clip(profile, profile_chars)}\n\n"
-            f"## Current best solution ({cv_text})\n```python\n{clip(base_code, code_chars)}\n```\n\n"
+            + (f"## Baseline facts (what the fixed baseline already does) and signals\n"
+               f"{clip(signals, signals_chars)}\n\n" if signals else "")
+            + f"## Current best solution ({cv_text})\n```python\n{clip(base_code, code_chars)}\n```\n\n"
             + (f"## Where the current model errs\n{clip(errors, errors_chars)}\n\n" if errors else "")
             + f"## Memory\n{clip(memory, memory_chars)}\n\n"
             f"Propose up to {n} new hypotheses as ONE JSON object.")

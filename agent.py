@@ -35,7 +35,7 @@ import pandas as pd
 
 import prompts_agent as P
 # Candidate — из schemas.py (P1), если он есть
-from agent_eval import Candidate, LocalEvaluator, RecipeEvaluator, ScreenEvaluator, find_file
+from agent_eval import Candidate, LocalEvaluator, RecipeEvaluator, ScreenEvaluator, find_file, recipe_signals
 from error_analysis import analyze_errors
 from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
 from postprocess import apply_weights, fit_class_weights
@@ -88,6 +88,8 @@ class AgentConfig:
     features_timeout: float = 300.0
     evaluate_timeout: float = 900.0
     max_feature_cols: int = 2000
+    max_new_columns: int = 8            # режим рецепта: одна гипотеза — одно небольшое изменение
+    signals: bool = True                # режим рецепта: что уже делает fallback, важности, дрейф — в промпт планировщика
     max_feature_gb: float = 4.0         # размер признаков train в памяти
     max_nan_share: float = 0.5          # «NaN-лавина»: доля пропусков выше max(этого, входной + 0.25)
     max_repairs: int = 1                # попыток ремонта по traceback / ошибке проверки
@@ -1015,6 +1017,44 @@ def _rows_like(features: pd.DataFrame, frame: Any) -> pd.DataFrame:
                          "precomputed feature rows") from error
 
 
+def useless_new_columns(x_train: pd.DataFrame, raw_train: pd.DataFrame, max_new: int, *,
+                        sample: int = 20_000, cache: dict | None = None) -> tuple[list[str], list[str], str]:
+    """Режим рецепта: (новые колонки, которые убрать; заметки для LLM; ошибка).
+
+    Убирается новая числовая колонка, которая — монотонное преобразование одной исходной числовой колонки
+    (|ρ Спирмена| > 0.999 по строкам без пропусков: log, sqrt, квадрат, масштаб — деревьям это ничего не даёт) или
+    копия уже оставленной новой. Ошибка — новых колонок больше max_new: гипотеза должна быть одним небольшим изменением.
+    """
+    new = [c for c in x_train.columns if c not in raw_train.columns]
+    if len(new) > max_new:
+        return [], [], (f"too many new columns ({len(new)} > {max_new}): implement only the hypothesis, "
+                        f"at most {max_new} new columns")
+    rows = np.linspace(0, len(x_train) - 1, min(sample, len(x_train))).astype(int)
+    cache = {} if cache is None else cache
+    if "raw" not in cache:
+        numeric = [c for c in raw_train.columns if pd.api.types.is_numeric_dtype(raw_train[c])]
+        cache["raw"] = raw_train.iloc[rows][numeric].rank().reset_index(drop=True)
+    raw_ranks = cache["raw"]
+    drop, notes = [], []
+    kept = pd.DataFrame(index=raw_ranks.index)
+    for col in new:
+        if not pd.api.types.is_numeric_dtype(x_train[col]):
+            continue
+        ranks = x_train[col].iloc[rows].rank().reset_index(drop=True)
+        if ranks.nunique() <= 1:
+            continue
+        for frame, reason in ((raw_ranks, "is a monotone transform of {} (useless for trees)"),
+                              (kept, "duplicates {}")):
+            rho = frame.corrwith(ranks).abs() if frame.shape[1] else pd.Series(dtype=float)
+            if len(rho.dropna()) and rho.max() > 0.999:
+                drop.append(col)
+                notes.append(f"{col} {reason.format(rho.idxmax())}")
+                break
+        else:
+            kept[col] = ranks
+    return drop, notes, ""
+
+
 def make_build_features(x_train: pd.DataFrame, x_test: pd.DataFrame) -> Callable:
     """build_features для evaluator.evaluate: код LLM уже исполнен в песочнице, отдаём готовые признаки."""
     def build_features(train: Any, test: Any, spec: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1026,6 +1066,8 @@ def make_build_features(x_train: pd.DataFrame, x_test: pd.DataFrame) -> Callable
 # ============================================================ решение «принять / отклонить»
 
 SCREEN_REJECT = "screen:"  # начало ошибки эксперимента, отсеянного скринингом (не сбой: без ремонта кода)
+USELESS_REJECT = "useless:"  # все новые колонки бесполезны деревьям (монотонные преобразования, копии)
+REJECTS = (SCREEN_REJECT, USELESS_REJECT)
 
 
 @dataclass
@@ -1288,7 +1330,8 @@ def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int
 class _Research:
     def __init__(self, spec: Any, best: Candidate | None, llm: Any, deadline: Any, cfg: AgentConfig, *,
                  evaluate: EvaluateFn, run_code: RunCodeFn, profile: Callable | None, guards: GuardFn | None,
-                 data: TaskData | None, tuner: TuneFn | None = None, screen: EvaluateFn | None = None) -> None:
+                 data: TaskData | None, tuner: TuneFn | None = None, screen: EvaluateFn | None = None,
+                 signals: str = "") -> None:
         self.spec, self.best, self.llm, self.deadline, self.cfg = spec, best, llm, deadline, cfg
         self.evaluate, self.run_code, self.profile_fn, self.guards, self.data = evaluate, run_code, profile, guards, data
         self.tuner = tuner
@@ -1299,6 +1342,9 @@ class _Research:
         self.screen_decision: Decision | None = None
         self.base_features: tuple[pd.DataFrame, pd.DataFrame] | None = None  # признаки текущего лучшего кода
         self.last_features: tuple[pd.DataFrame, pd.DataFrame] | None = None   # признаки последней оценки
+        self.signals = signals            # что уже делает fallback, важности, дрейф (agent_eval.recipe_signals)
+        self.rank_cache: dict = {}        # ранги исходных колонок для useless_new_columns
+        self.filter_notes: list[str] = []
         self.greater = bool(getattr(spec, "greater_is_better", False))
         self.memory = ExperimentMemory()
         self.accepted: list[Candidate] = []
@@ -1656,6 +1702,7 @@ class _Research:
             task_line=self.task_line, task_text=self.task_text, profile=self.profile_text, base_code=self.base_code,
             cv_text=self._cv_text(), n=cfg.hypotheses_per_plan, errors=self.errors_text,
             can_tune=self.tuner is not None, can_search_models=cfg.model_search, recipe=self.recipe,
+            signals=self.signals,
             memory=self.memory.planner_brief(cfg.memory_chars, kinds=self._kinds(), task_type=self.task_type),
             task_chars=cfg.task_text_chars, profile_chars=cfg.profile_chars, memory_chars=cfg.memory_chars)
         kw = dict(max_tokens=cfg.plan_max_tokens, temperature=cfg.plan_temperature)
@@ -1780,6 +1827,18 @@ class _Research:
                                 timeout=min(cfg.features_timeout, max(1.0, self._left())))
         if features.error:
             return None, features.error
+        self.filter_notes = []
+        if self.recipe and name != "exp_00_base":
+            drop, notes, problem = useless_new_columns(features.x_train, self.data.train_x, cfg.max_new_columns,
+                                                       cache=self.rank_cache)
+            if problem:
+                return None, problem
+            self.filter_notes = notes
+            if drop:
+                features.x_train = features.x_train.drop(columns=drop)
+                features.x_test = features.x_test.drop(columns=drop)
+            if not [c for c in features.x_train.columns if c not in self.data.train_x.columns]:
+                return None, f"{USELESS_REJECT} no informative new columns: {'; '.join(notes) or 'none added'}"
         self.last_features = (features.x_train, features.x_test)
         self.screen_decision = None
         if screen and self.screen is not None:
@@ -1875,7 +1934,7 @@ class _Research:
                              else "no change vs the current best code")
                     break
                 cand, error = self._evaluate_code(code, f"exp_{n:02d}", screen=True)
-                if cand is None and error.startswith(SCREEN_REJECT):
+                if cand is None and error.startswith(REJECTS):
                     status, decision = "rejected", self.screen_decision
                     break
                 if cand is not None or repairs >= cfg.max_repairs or self._left() < self._expected_seconds():
@@ -1895,6 +1954,8 @@ class _Research:
                     error = f"harness: {'; '.join(ignored)} | {error}"
                 if note:
                     error = f"{note} | {error}"
+            if self.filter_notes and not error.startswith(USELESS_REJECT):  # LLM узнаёт, что и почему отброшено
+                error = f"{error} | dropped: {'; '.join(self.filter_notes)}"
         except LLMUnavailable:
             raise
         except Exception as exc:  # ошибка харнесса на одном эксперименте не должна останавливать цикл
@@ -2077,10 +2138,18 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
         log.warning("research: evaluator.evaluate недоступен — исследование пропущено")
         return []
 
+    signals = ""
     if getattr(evaluate, "recipe_mode", False):  # модели, параметры и веса классов — у рецепта fallback
         cfg = replace(cfg, model_search=False, auto_model_search=False, auto_tune=False, postprocess=False)
         tuner = None
         no_tuner = True
+        if cfg.signals and isinstance(evaluate, RecipeEvaluator):
+            start = time.monotonic()
+            try:
+                signals = recipe_signals(evaluate)
+                log.info("research: signals for the planner in %.0fs:\n%s", time.monotonic() - start, signals)
+            except Exception as error:  # подсказка, а не обязательный шаг
+                log.warning("research: signals failed: %s: %s", type(error).__name__, P.clip(str(error), 300))
         if screen is None and cfg.screen and isinstance(evaluate, RecipeEvaluator):
             try:
                 screen = ScreenEvaluator(evaluate, seeds=cfg.screen_seeds)
@@ -2096,7 +2165,8 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
                          run_code=run_code or _optional("sandbox", "run_code") or _local_run_code,
                          profile=profile or _optional("eda", "profile"),
                          guards=guards or _optional("guards", "check_candidate"), data=data,
-                         tuner=None if no_tuner else tuner or _optional("tuning", "tune"), screen=screen)
+                         tuner=None if no_tuner else tuner or _optional("tuning", "tune"), screen=screen,
+                         signals=signals)
         return loop.run()
     except LLMUnavailable as error:
         log.warning("research: LLM недоступна (%s) — возвращаем накопленное", P.clip(str(error), 300))

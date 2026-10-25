@@ -586,3 +586,127 @@ def _greater(metric: str) -> bool:
 
 
 _LOWER = ("rmse", "mse", "mae", "rmsle", "mape", "logloss")
+
+
+# ============================================================ сигналы для планировщика
+
+def _raw_name(column: str, renamed: dict) -> str:
+    """Имя исходной колонки train.csv для колонки матрицы fallback (безопасные имена, производные «col__freq»)."""
+    return str(renamed.get(column, column)).split("__")[0]
+
+
+def _by_raw(values: dict, renamed: dict) -> dict:
+    out: dict[str, float] = {}
+    for col, value in values.items():
+        raw = _raw_name(col, renamed)
+        out[raw] = out.get(raw, 0.0) + float(value)
+    return out
+
+
+def _gain_importance(x: pd.DataFrame, y: np.ndarray, task: str, threads: int, rounds: int, seed: int) -> dict:
+    import lightgbm as lgb
+
+    cls = lgb.LGBMRegressor if task == "regression" else lgb.LGBMClassifier
+    model = cls(n_estimators=rounds, learning_rate=0.05, num_leaves=63, subsample=0.8, subsample_freq=1,
+                colsample_bytree=0.8, importance_type="gain", random_state=seed, n_jobs=threads, verbose=-1)
+    model.fit(x, y)
+    total = float(np.sum(model.feature_importances_)) or 1.0
+    return {c: float(v) / total for c, v in zip(x.columns, model.feature_importances_)}
+
+
+def recipe_signals(recipe: RecipeEvaluator, *, threads: int | None = None, rounds: int = 200,
+                   max_rows: int = 100_000, top: int = 10, max_chars: int = 1600) -> str:
+    """Что уже делает лучший кандидат fallback и где сигнал — текст для планировщика агента (только агрегаты).
+
+    - модели и веса рецепта, схема CV (новый период в test / группы дублей), исключённые колонки, признаки сущности;
+    - что уже построено предобработкой: частотное кодирование, части дат, TF-IDF текста, удалённые колонки;
+    - важность признаков (gain одного LightGBM на матрице fallback, по исходным колонкам);
+    - дрейф train → test: AUC классификатора «строка из test?» и колонки, по которым он отличает test.
+    Без этого LLM предлагала то, что уже есть (частотное кодирование), и не знала, какие колонки нестабильны.
+    """
+    import fallback
+
+    ctx = recipe.ctx
+    data, report = ctx.data, ctx.data.prep.report
+    renamed = report.get("renamed", {})
+    threads = threads or recipe.threads or fallback.n_threads()
+    lines = ["Baseline models (blend weights): "
+             + ", ".join(f"{name} {weight:.2f}" for name, weight in recipe.members.items())]
+    scheme = data.cv_scheme or {}
+    if scheme.get("kind") == "period":
+        lines.append(f"CV folds are whole periods of {scheme.get('column')}; test is a NEW period "
+                     f"{scheme.get('test_levels')}: features must generalize to an unseen period.")
+    elif scheme.get("kind") == "duplicates":
+        lines.append("CV keeps identical rows in one fold (test rows rarely have exact twins in train): "
+                     "memorizing duplicates does not help.")
+    runs = [recipe.runs[name] for name in recipe.members]
+    excluded = sorted({_raw_name(c, renamed) for r in runs for c in r.exclude})
+    if excluded:
+        lines.append(f"Excluded from all models (hurt CV): {', '.join(excluded)}.")
+    if data.entity is not None and any(r.entity for r in runs):
+        key = ", ".join(map(str, data.entity.get("columns", [])))
+        static = ", ".join(map(str, data.entity.get("static") or []))
+        lines.append(f"Already features: target mean/median/count of the same entity in other rows (key {key}"
+                     + (f"; refined by {static}" if static else "") + "). Do not rebuild them.")
+    freq = sorted({_raw_name(c, renamed) for c in data.prep.X.columns if str(renamed.get(c, c)).endswith("__freq")})
+    if freq:
+        lines.append(f"Already features: frequency encoding of {', '.join(freq)}.")
+    if report.get("dates"):
+        lines.append("Already features: year/month/day/weekday/day-of-year/hour/timestamp of "
+                     f"{', '.join(report['dates'])}.")
+    if report.get("text"):
+        lines.append(f"Already features: text length and TF-IDF SVD of {', '.join(report['text'])}.")
+    if report.get("dropped"):
+        lines.append("Dropped by preprocessing: " + ", ".join(f"{c} ({r})" for c, r in
+                                                             list(report["dropped"].items())[:8]) + ".")
+
+    try:
+        x, x_test, _ = ctx.data.frame("lightgbm")
+        drop = [c for r in runs for c in r.exclude if c in x.columns]
+        x, x_test = x.drop(columns=drop), x_test.drop(columns=drop)
+        rng = np.random.default_rng(0)
+        rows = rng.choice(len(x), min(len(x), max_rows), replace=False)
+        y = np.log1p(data.y) if data.task == "regression" and runs[0].transform == "log1p" else data.y
+        share = _by_raw(_gain_importance(x.iloc[rows], y[rows], data.task, threads, rounds, 0), renamed)
+        ranked = sorted(share.items(), key=lambda kv: -kv[1])
+        lines.append("Feature importance (gain share): "
+                     + ", ".join(f"{c} {100 * v:.1f}%" for c, v in ranked[:top]) + ".")
+        weak = [c for c, v in ranked if v < 0.002]
+        if weak:
+            lines.append(f"Almost unused by the model: {', '.join(weak[:top])}.")
+
+        both = pd.concat([x.iloc[rows], x_test.iloc[rng.choice(len(x_test), min(len(x_test), max_rows),
+                                                               replace=False)]], ignore_index=True)
+        is_test = np.r_[np.zeros(len(rows)), np.ones(len(both) - len(rows))]
+        period = scheme.get("column") if scheme.get("kind") == "period" else None
+        both = both.drop(columns=[c for c in both.columns if _raw_name(c, renamed) == period])
+        auc, drift = _adversarial(both, is_test, threads, rounds)
+        drift_raw = sorted(_by_raw(drift, renamed).items(), key=lambda kv: -kv[1])
+        if auc >= 0.6:
+            lines.append(f"Train/test drift: a model tells test rows from train with AUC {auc:.2f}"
+                         + (f" (without {period})" if period else "") + "; most different: "
+                         + ", ".join(f"{c} {100 * v:.0f}%" for c, v in drift_raw[:8])
+                         + ". Raw values of drifting columns generalize poorly: prefer ratios or values relative "
+                           "to a group/period.")
+        else:
+            lines.append(f"Train/test drift is small (AUC {auc:.2f}).")
+    except Exception as error:  # сигналы — подсказка, без них агент работает как раньше
+        lines.append(f"(feature importance / drift unavailable: {type(error).__name__})")
+    text = "\n".join(f"- {line}" for line in lines)
+    return text if len(text) <= max_chars else text[:max_chars - 20] + "...[truncated]"
+
+
+def _adversarial(x: pd.DataFrame, is_test: np.ndarray, threads: int, rounds: int) -> tuple[float, dict]:
+    """AUC «строка из test?» на отложенной четверти и доли gain колонок этого классификатора."""
+    import lightgbm as lgb
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import train_test_split
+
+    tr, va = train_test_split(np.arange(len(x)), test_size=0.25, random_state=0, stratify=is_test)
+    model = lgb.LGBMClassifier(n_estimators=rounds, learning_rate=0.05, num_leaves=31, subsample=0.8,
+                               subsample_freq=1, colsample_bytree=0.8, importance_type="gain", random_state=0,
+                               n_jobs=threads, verbose=-1)
+    model.fit(x.iloc[tr], is_test[tr])
+    auc = float(roc_auc_score(is_test[va], model.predict_proba(x.iloc[va])[:, 1]))
+    total = float(np.sum(model.feature_importances_)) or 1.0
+    return auc, {c: float(v) / total for c, v in zip(x.columns, model.feature_importances_)}
