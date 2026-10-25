@@ -15,18 +15,26 @@
 fallback 30.08, с членами xgb_log / lgbm_slow — 30.05. Модели: xgb_log 30.28, lgbm_log_slow 30.42, lgbm_slow 30.50,
 cat_log 31.51 против 30.66 у LightGBM fallback; 11–28 с на модель.
 
+lag-признаки (test — новый период и есть сущность fallback): последний известный таргет сущности в более раннем
+периоде и давность (lag_columns). Та же копия: XGBoost 30.66 → 30.24, LightGBM с сущностью 30.66 → 30.52; по CV всех
+фолдов хуже (в году 1 истории нет), на последнем фолде — лучше (31.6 против 32.3). Строка периода g видит только
+периоды < g, test — весь train; таргеты валидационного периода бывают признаком у ПОЗДНИХ строк обучения, но не у
+самих валидационных строк (их таргет модель не видит).
+
 Ничего не пишет на диск: кандидатов записывает solution.py, если бленд с ними честно лучше уже записанного.
 Сбой одной модели или нехватка времени пропускает её, а не останавливает этап.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 import fallback
 import metrics
@@ -52,6 +60,7 @@ class Member:
     transform: str | None = None
     weights: dict | None = None
     cost: float = 1.0
+    lag: bool = False      # матрицы рецепта + lag-признаки сущности (lag_data)
 
 
 def context(best: Any) -> Any:
@@ -68,6 +77,54 @@ def reference(ctx: Any) -> Any:
         return max(weighted, key=lambda wr: wr[0])[1]
     sign = 1.0 if metrics.greater_is_better(ctx.data.metric) else -1.0
     return max(ctx.runs, key=lambda r: sign * r.cv)
+
+
+def lag_columns(data: Any) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """lag-признаки сущности для train и test: по каждому уровню ключа (data.entity) — таргет сущности в последнем
+    более раннем периоде (среднее по строкам того периода) и давность в периодах. None — нет периодов или сущности."""
+    if data.entity is None or data.period_order is None:
+        return None
+    order = np.asarray(data.period_order, dtype=float)
+    test_period = float(np.nanmax(order)) + 1.0
+    train_cols, test_cols = {}, {}
+    for i, level in enumerate(data.entity.get("levels") or [data.entity]):
+        key, key_test = np.asarray(level["key_train"]), np.asarray(level["key_test"])
+        per_key = (pd.DataFrame({"k": key, "y": np.asarray(data.y, dtype=float), "p": order})
+                   .groupby(["k", "p"], sort=False)["y"].mean().reset_index().sort_values("p"))
+        last, gap = np.full(len(key), np.nan), np.full(len(key), np.nan)
+        for g in np.unique(order[np.isfinite(order)]):
+            rows = np.flatnonzero(order == g)
+            src = per_key[per_key["p"] < g]
+            if src.empty:
+                continue
+            latest = src.groupby("k", sort=False).last()
+            keys = pd.Series(key[rows])
+            last[rows], gap[rows] = keys.map(latest["y"]).to_numpy(), g - keys.map(latest["p"]).to_numpy()
+        latest = per_key.groupby("k", sort=False).last()
+        keys_test = pd.Series(key_test)
+        train_cols[f"lag{i + 1}__last"], train_cols[f"lag{i + 1}__gap"] = last, gap
+        test_cols[f"lag{i + 1}__last"] = keys_test.map(latest["y"]).to_numpy()
+        test_cols[f"lag{i + 1}__gap"] = test_period - keys_test.map(latest["p"]).to_numpy()
+    return pd.DataFrame(train_cols).astype("float32"), pd.DataFrame(test_cols).astype("float32")
+
+
+def lag_data(ctx: Any) -> Any | None:
+    """Копия данных рецепта, где к матрицам LightGBM/XGBoost и CatBoost добавлены lag-признаки (кэш в ctx)."""
+    cached = getattr(ctx, "_final_lag_data", "missing")
+    if cached != "missing":
+        return cached
+    data, out = ctx.data, None
+    columns = lag_columns(data)
+    if columns is not None:
+        extra_tr, extra_te = columns
+        out = copy.copy(data)
+        out.frames = {}
+        for model in ("lightgbm", "catboost"):
+            x, x_test, cats = data.frame(model)
+            out.frames[model] = (pd.concat([x.reset_index(drop=True), extra_tr], axis=1),
+                                 pd.concat([x_test.reset_index(drop=True), extra_te], axis=1), cats)
+    ctx._final_lag_data = out
+    return out
 
 
 def _imbalance(y: np.ndarray) -> float:
@@ -96,6 +153,11 @@ def members(ctx: Any, ref: Any) -> list[Member]:
                     Member(f"cat{tag}", "catboost", {}, alt_tf, cost=2.5)]
         out += [Member("lgbm_et", "lightgbm", {"extra_trees": True}, same),
                 Member("xgb_d5", "xgboost", {"max_depth": 5}, same, cost=1.5)]
+        if data.entity is not None and data.period_order is not None:  # test — новый период: lag-признаки
+            out[1:1] = [Member("xgb_lag", "xgboost", {}, same, lag=True, cost=1.5),
+                        Member("lgbm_lag", "lightgbm", {}, same, lag=True)]
+            if alt != "none":
+                out.append(Member(f"xgb{tag}_lag", "xgboost", {}, alt_tf, lag=True, cost=1.5))
         return out
     regular = {"min_child_samples": 100, "colsample_bytree": 0.5, "reg_lambda": 5.0}
     if metrics.get(data.metric).tunable and _imbalance(data.y) >= CLASS_WEIGHTED:
@@ -156,7 +218,10 @@ def estimate(ctx: Any, member: Member, unit: float) -> float:
 def fit(ctx: Any, ref: Any, member: Member, stop_at: float, threads: int) -> Any | None:
     """fallback.Run модели на рецепте (те же фолды, признаки сущности и исключения, что у опорного прогона) или
     None (упала, нет времени, NaN/inf в прогнозах)."""
-    data = ctx.data
+    data = lag_data(ctx) if member.lag else ctx.data
+    if data is None:
+        log.info("final: %s пропущен: нет lag-признаков (нет периодов или сущности)", member.name)
+        return None
     try:
         weights = None
         if member.weights:

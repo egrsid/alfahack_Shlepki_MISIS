@@ -109,3 +109,21 @@ def test_period_blend_is_written_unless_clearly_worse_than_fallback(tmp_path):
     single = blend_like({folds[0]: 1.03, folds[1]: 0.99})
     single.meta.pop("blend")                                 # не бленд — только строгое правило
     assert solution.pick(spec, best, [single], best, "test") is None
+
+
+def test_new_level_rows_patch_any_written_candidate(tmp_path):
+    import solution
+
+    spec = period_task(tmp_path / "reg")
+    best = fallback.run(spec, None, TWO)
+    mixed = ensemble.blend(spec, [fallback.honest_view(best), *fallback.pool(best)])
+    if mixed is None or "new_levels" not in mixed.meta:
+        return
+    patched = solution.with_new_levels(best, mixed)
+    index = np.asarray(mixed.meta["new_levels"]["test_index"])
+    changed = np.flatnonzero(~np.isclose(patched.test_pred, best.test_pred))
+    assert set(changed) <= set(index.tolist()) and len(changed) > 0
+    assert np.allclose(patched.test_pred[index], mixed.test_pred[index])
+    assert patched.name.endswith("+new_levels") and "test_index" not in patched.meta["new_levels"]
+    assert solution.with_new_levels(patched, mixed) is None and solution.with_new_levels(mixed, mixed) is None
+    assert solution.with_new_levels(best, None) is None

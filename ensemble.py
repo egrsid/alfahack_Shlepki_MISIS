@@ -211,6 +211,7 @@ def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0, recent
         test_pred = np.array(test_pred, dtype=float, copy=True)
         test_pred[risky] = _mix(w_new, tests, risky)
         out_meta["new_levels"] = {"test_rows": int(risky.sum()), "stress_rows": int(stress.sum()),
+                                  "test_index": np.flatnonzero(risky),
                                   "blend": {n: round(float(w), 4) for n, w in zip(names, w_new) if w > 0}}
         log.info("ensemble: %d строк test с новыми уровнями категорий — бленд по %d стресс-строкам OOF: %s",
                  int(risky.sum()), int(stress.sum()), out_meta["new_levels"]["blend"])

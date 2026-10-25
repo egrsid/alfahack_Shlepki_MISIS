@@ -54,6 +54,19 @@ def test_imbalanced_macro_f1_members_use_class_weights(tmp_path):
         assert np.allclose(cand.oof.sum(axis=1), 1.0, atol=1e-6)
 
 
+def test_binary_auc_members_without_class_weights(tmp_path):
+    spec, _ = classification_task(tmp_path / "bin", n_classes=2, labels=["no", "yes"], metric="roc_auc")
+    best = fallback.run(spec, None, ONE)
+    ctx = final.context(best)
+    plan = final.members(ctx, final.reference(ctx))
+    assert {m.name for m in plan} == {"lgbm_slow", "lgbm_reg", "xgb_d5", "cat_d8"}  # AUC — без весов классов
+    zoo = final.train(spec, best, until=soon(), threads=2, n_random=2)
+    assert zoo and all(c.oof.shape == best.oof.shape for c in zoo)
+    mixed = ensemble.blend(spec, [fallback.honest_view(best), *fallback.pool(best), *zoo])
+    if mixed is not None:
+        assert mixed.test_pred.shape == best.test_pred.shape
+
+
 def test_no_time_or_no_recipe_gives_nothing(tmp_path):
     spec = make_multiclass_task(tmp_path / "cls")
     best = fallback.run(spec, None, ONE)
@@ -119,3 +132,40 @@ def test_layout_of_three_hours(monkeypatch):
     assert solution.zoo_a_end(short, with_agent=True) == 1800 - solution.AGENT_MIN_SECONDS
     monkeypatch.setenv("SOLUTION_FINAL_SECONDS", "0")
     assert solution.zoo_seconds(d, 4200) == 0
+
+
+def entity_period_task(root, n_buildings: int = 220, seed: int = 0):
+    """Здания (уникальная площадь) наблюдаются в годах 1–4 (train) и 5 (test); таргет — эффект здания + год + шум."""
+    from p3_fixtures import Spec, write_task
+
+    rng = np.random.default_rng(seed)
+    area = rng.uniform(1000, 90000, n_buildings).round(1)
+    kind = rng.choice(["office", "school", "shop"], n_buildings)
+    effect = rng.normal(80, 25, n_buildings)
+    rows = [(b, year) for year in range(1, 6) for b in range(n_buildings) if rng.random() < 0.8]
+    b, year = np.array([r[0] for r in rows]), np.array([r[1] for r in rows])
+    frame = pd.DataFrame({"id": np.arange(len(rows)), "year": year, "area": area[b], "kind": kind[b],
+                          "temp": rng.normal(size=len(rows))})
+    y = effect[b] + 2.0 * year + 3 * frame.temp.to_numpy() + rng.normal(scale=3, size=len(rows))
+    train, test = frame[year < 5].assign(target=y[year < 5]), frame[year == 5].reset_index(drop=True)
+    write_task(root, train, test, pd.DataFrame({"id": test.id, "target": 0.0}), "Predict target. Metric: RMSE.")
+    return Spec(root, "id", "target", "regression", "rmse", False)
+
+
+def test_lag_members_for_period_task_with_entity(tmp_path):
+    spec = entity_period_task(tmp_path / "reg")
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm", "xgboost"), bag_seeds=1, write=False))
+    ctx = final.context(best)
+    assert ctx.data.entity is not None and ctx.data.period_order is not None
+    lag_tr, lag_te = final.lag_columns(ctx.data)
+    order = np.asarray(ctx.data.period_order)
+    assert lag_tr["lag1__last"][order == order.min()].isna().all()  # у первого периода прошлого нет
+    assert lag_tr["lag1__last"][order > order.min()].notna().mean() > 0.5 and lag_te["lag1__last"].notna().mean() > 0.5
+    assert (lag_tr["lag1__gap"].dropna() >= 1).all() and (lag_te["lag1__gap"].dropna() >= 1).all()
+    names = [m.name for m in final.members(ctx, final.reference(ctx))]
+    assert {"xgb_lag", "lgbm_lag"} <= set(names)
+    zoo = final.train(spec, best, until=soon(), threads=2, n_random=0)
+    lagged = [c for c in zoo if c.meta["member"].lag]
+    assert lagged and all(np.isfinite(c.test_pred).all() for c in lagged)
+    bagged = final.bag(spec, best, lagged[:1], {lagged[0].name: 1.0}, until=soon(), threads=2)
+    assert bagged and bagged[0].meta["member"].lag  # сиды — на тех же lag-матрицах

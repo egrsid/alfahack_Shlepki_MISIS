@@ -221,12 +221,32 @@ def pick(spec: Any, current: Any, options: list, trusted: Any, stage: str) -> An
     return winner
 
 
+def with_new_levels(cand: Any, mixed: Any) -> Any | None:
+    """Кандидат cand, у которого прогнозы строк test с новыми уровнями категорий взяты из бленда mixed (там они —
+    по стресс-строкам OOF, ensemble.new_level_rows); None — нечего менять (нет таких строк, cand — сам бленд или
+    уже с ними, другие классы). Защита и тогда, когда сам бленд по CV не пишется: на копии public-регрессии с новым
+    штатом в test — 42.7 RMSE по всем строкам против 49.7 у fallback."""
+    info = ((getattr(mixed, "meta", None) or {}).get("new_levels")) if mixed is not None else None
+    meta = getattr(cand, "meta", None) or {}
+    if not info or cand is mixed or meta.get("new_levels") or meta.get("classes") != mixed.meta.get("classes"):
+        return None
+    index = np.asarray(info.get("test_index", []), dtype=int)
+    test_pred = np.array(cand.test_pred, dtype=float, copy=True)
+    if not len(index) or test_pred.shape != np.shape(mixed.test_pred):
+        return None
+    test_pred[index] = np.asarray(mixed.test_pred, dtype=float)[index]
+    out = copy.copy(cand)
+    out.name, out.test_pred = f"{cand.name}+new_levels", test_pred
+    out.meta = {**meta, "new_levels": {k: v for k, v in info.items() if k != "test_index"} | {"from": mixed.name}}
+    return out
+
+
 def improve(spec: Any, best: Any, current: Any, extra: list, stage: str, members: list = (),
             report: dict | None = None) -> Any:
     """Бленд «все модели fallback + extra + members» и сами extra; что честно лучше записанного — пишется.
     members — только члены бленда (пул агента: как отдельный сабмит не прошли его правило принятия). report — сюда
     кладётся собранный бленд (report["blend"], веса — в его meta["blend"]). Возвращает то, что теперь в файле."""
-    options = list(extra)
+    options, mixed = list(extra), None
     try:
         import ensemble
         # fallback — с честным OOF: его веса бленда подобраны на тех же строках, а ensemble оценивает честно
@@ -238,6 +258,11 @@ def improve(spec: Any, best: Any, current: Any, extra: list, stage: str, members
     except Exception:
         log.exception("%s: бленд не собран", stage)
     winner = pick(spec, current, options, best, stage)
+    patched = with_new_levels(winner if winner is not None else current, mixed)
+    if patched is not None and not suspicious(spec, patched, best):
+        log.info("%s: %d строк test с новыми уровнями категорий — прогнозы из бленда %s", stage,
+                 patched.meta["new_levels"]["test_rows"], mixed.name)
+        winner = patched
     if winner is None:
         return current
     submission.write_candidate(spec, winner)
