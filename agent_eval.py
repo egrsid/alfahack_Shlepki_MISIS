@@ -406,8 +406,9 @@ class RecipeEvaluator:
             self._inputs = (train[feats], test[feats].reset_index(drop=True), spec_dict)
         return self._inputs
 
-    def _frames(self, spec: Any, build_features: Any) -> tuple[Any, list[str]]:
-        """Копия данных fallback, где к матрицам каждой модели рецепта добавлены новые колонки build_features."""
+    def _frames(self, spec: Any, build_features: Any, models: Any = None) -> tuple[Any, list[str]]:
+        """Копия данных fallback, где к матрицам моделей (по умолчанию — моделей рецепта) добавлены новые колонки
+        build_features."""
         import copy as copy_module
 
         ctx = self.ctx
@@ -421,8 +422,7 @@ class RecipeEvaluator:
 
         data = copy_module.copy(ctx.data)
         data.frames = {}
-        for name in self.members:
-            model = self.runs[name].model
+        for model in models or [self.runs[name].model for name in self.members]:
             key = "lightgbm" if model in ("lightgbm", "xgboost") else model
             if key in data.frames:
                 continue
@@ -514,3 +514,75 @@ class RecipeEvaluator:
 
         return self._candidate(data, new, average(raw["oof"], oof), average(raw["test_pred"], test_pred),
                                average(raw["honest"], honest), total)
+
+
+class ScreenEvaluator:
+    """Быстрая оценка гипотезы перед полной (RecipeEvaluator): один LightGBM рецепта fallback на тех же матрицах,
+    фолдах, признаках сущности и исключениях, но с фиксированным числом деревьев (медиана итераций этого LightGBM у
+    fallback, без ранней остановки) и с несколькими сидами (по умолчанию 2), усреднёнными на OOF.
+
+    Зачем: полная оценка переобучает все члены бленда (2–5 мин на гипотезу), а новая колонка меняет обучение деревьев
+    почти как смена сида — шум сравнения порядка самого выигрыша. Скрининг в разы быстрее, а общие сиды у эталона и
+    кандидата и отсутствие выбора итерации по валидации делают парную разность тише. Решение «принять» всё равно
+    принимается по полной оценке; скрининг только отсеивает гипотезы, которые явно не помогают.
+
+    Контракт тот же: (spec, build_features, cfg, deadline) -> Candidate; fold_scores — сырые оценки по фолдам
+    (без порога/весов классов: им нужны вероятности бленда, а для отсева достаточно сравнения моделей).
+    """
+
+    def __init__(self, recipe: RecipeEvaluator, seeds: int = 2, min_rounds: int = 50,
+                 threads: int | None = None) -> None:
+        runs = [r for r in recipe.ctx.runs if r.model == "lightgbm" and r.iterations]
+        if not runs:
+            raise ValueError("fallback has no trained LightGBM to screen with")
+        members = [r for r in runs if r.name in recipe.members]
+        # LightGBM из рецепта (самый весомый) — иначе лучший LightGBM fallback по CV
+        sign = 1.0 if _greater(recipe.ctx.data.metric) else -1.0
+        self.run = (max(members, key=lambda r: recipe.members[r.name]) if members
+                    else max(runs, key=lambda r: sign * r.cv))
+        self.rounds = max(min_rounds, int(np.median(self.run.iterations)))
+        self.recipe, self.seeds = recipe, max(1, int(seeds))
+        self.threads = threads or recipe.threads
+        self.calls = 0
+
+    @property
+    def name(self) -> str:
+        return f"{self.run.name}, {self.rounds} trees, {self.seeds} seeds"
+
+    def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
+        import fallback
+
+        self.calls += 1
+        run, ctx = self.run, self.recipe.ctx
+        data, new = self.recipe._frames(spec, build_features, models=[run.model])
+        threads = self.threads or fallback.n_threads()
+        oofs, tests = [], []
+        for seed in range(self.seeds):
+            left = _left(deadline)
+            if left <= 0:
+                raise TimeoutError("screening stopped: no time left")
+            stop_at = time.monotonic() + (left / (self.seeds - seed) if math.isfinite(left) else 1e9)
+            extra = {**(getattr(run, "extra", None) or {}), "n_estimators": self.rounds,
+                     **fallback.seed_params(run.model, ctx.config.seed + seed)}
+            fitted = fallback.cv_model(data, f"screen_{run.name}", run.model, ctx.config, stop_at,
+                                       transform=run.transform, extra=extra, threads=threads, exclude=run.exclude,
+                                       entity=run.entity, early_stopping=0)
+            oofs.append(fitted.oof)
+            tests.append(fitted.test_pred)
+        oof, test_pred = sum(oofs) / len(oofs), sum(tests) / len(tests)
+        scores = [float(s) for s in fallback._fold_scores(data, oof)]
+        return Candidate(name="agent_screen", cv_score=float(np.mean(scores)), cv_std=float(np.std(scores)),
+                         oof=oof, test_pred=test_pred,
+                         meta={"fold_scores": scores, "fold_ids": data.folds, "new_columns": new,
+                               "evaluator": "screen", "screen": self.name, "classes": data.classes})
+
+
+def _greater(metric: str) -> bool:
+    team = _team_metrics()
+    try:
+        return bool(team.greater_is_better(metric)) if team is not None else metric_name(metric) not in _LOWER
+    except Exception:
+        return metric_name(metric) not in _LOWER
+
+
+_LOWER = ("rmse", "mse", "mae", "rmsle", "mape", "logloss")

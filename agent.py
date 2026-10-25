@@ -34,7 +34,8 @@ import numpy as np
 import pandas as pd
 
 import prompts_agent as P
-from agent_eval import Candidate, LocalEvaluator, RecipeEvaluator, find_file  # Candidate — из schemas.py (P1), если он есть
+# Candidate — из schemas.py (P1), если он есть
+from agent_eval import Candidate, LocalEvaluator, RecipeEvaluator, ScreenEvaluator, find_file
 from error_analysis import analyze_errors
 from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
 from postprocess import apply_weights, fit_class_weights
@@ -72,13 +73,14 @@ TuneFn = Callable[[Any, Callable, dict, Any], dict]
 class AgentConfig:
     """Все числа агента в одном месте; времена — верхние границы, реально режет Deadline."""
 
-    # итерации и стоп-критерии
-    max_iters: int = 12
+    # итерации и стоп-критерии. Главный ограничитель — окно research (Deadline): прежние 12 итераций и плато из 5
+    # неудач останавливали агента через 15–25 мин из ~2 ч окна; бюджет LLM это позволяет (≈6 тыс. токенов/итерация)
+    max_iters: int = 100
     hypotheses_per_plan: int = 6
     max_empty_plans: int = 2            # подряд планов без новых гипотез → стоп
-    max_consecutive_failures: int = 3
-    max_no_improve: int = 5             # плато
-    max_tokens: int = 120_000           # доля агента в токенах на задачу (вход + выход)
+    max_consecutive_failures: int = 6
+    max_no_improve: int = 30            # плато
+    max_tokens: int = 600_000           # доля агента в токенах на задачу (вход + выход)
     min_start_seconds: float = 300.0    # если до конца окна research меньше — не начинаем
     llm_reserve_seconds: float = 60.0   # оценка времени на вызовы LLM за одну итерацию
     # песочница и оценка
@@ -131,6 +133,12 @@ class AgentConfig:
     # конец исследования: множители вероятностей классов под метрику по меткам (macro F1, accuracy, ...)
     postprocess: bool = True
     postprocess_folds: int = 5          # части OOF для честной оценки весов
+    # скрининг поверх рецепта fallback (agent_eval.ScreenEvaluator): гипотеза сначала оценивается одним LightGBM с
+    # фиксированным числом деревьев и screen_seeds сидами; полная оценка рецептом — только если выигрыш скрининга
+    # больше screen_k · шум парных разностей (0 — любой положительный)
+    screen: bool = True
+    screen_seeds: int = 2
+    screen_k: float = 0.0
     # конец исследования поверх рецепта fallback: лучший принятый — с тем же числом сидов, что итог fallback (bag3)
     bag_best: bool = True
     final_reserve_seconds: float = 600.0  # доводка идёт после окна research, но оставляет столько до конца 3 часов
@@ -1017,6 +1025,9 @@ def make_build_features(x_train: pd.DataFrame, x_test: pd.DataFrame) -> Callable
 
 # ============================================================ решение «принять / отклонить»
 
+SCREEN_REJECT = "screen:"  # начало ошибки эксперимента, отсеянного скринингом (не сбой: без ремонта кода)
+
+
 @dataclass
 class Decision:
     accept: bool
@@ -1277,10 +1288,17 @@ def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int
 class _Research:
     def __init__(self, spec: Any, best: Candidate | None, llm: Any, deadline: Any, cfg: AgentConfig, *,
                  evaluate: EvaluateFn, run_code: RunCodeFn, profile: Callable | None, guards: GuardFn | None,
-                 data: TaskData | None, tuner: TuneFn | None = None) -> None:
+                 data: TaskData | None, tuner: TuneFn | None = None, screen: EvaluateFn | None = None) -> None:
         self.spec, self.best, self.llm, self.deadline, self.cfg = spec, best, llm, deadline, cfg
         self.evaluate, self.run_code, self.profile_fn, self.guards, self.data = evaluate, run_code, profile, guards, data
         self.tuner = tuner
+        # скрининг: эталон — тот же быстрый evaluator на признаках текущего лучшего кода (пересчёт при его смене)
+        self.screen = screen
+        self.screen_ref: Candidate | None = None
+        self.screen_ref_hash = ""
+        self.screen_decision: Decision | None = None
+        self.base_features: tuple[pd.DataFrame, pd.DataFrame] | None = None  # признаки текущего лучшего кода
+        self.last_features: tuple[pd.DataFrame, pd.DataFrame] | None = None   # признаки последней оценки
         self.greater = bool(getattr(spec, "greater_is_better", False))
         self.memory = ExperimentMemory()
         self.accepted: list[Candidate] = []
@@ -1523,6 +1541,7 @@ class _Research:
             return False
         reported = _honest_cv(self.best)  # итог fallback (до замены best на эталон рецепта)
         self.base_code, self.current, self.best = BASE_CODE_EXTRA, cand, cand  # результат — не хуже рецепта
+        self.base_features = self.last_features
         log.info("research: reference = fallback recipe %s=%.5g, one seed, honest (fallback result %s), %.0fs",
                  self.data.spec_dict["metric"], cand.cv_score,
                  f"{reported:.5g}" if reported is not None else "n/a", self.reference_seconds)
@@ -1743,8 +1762,11 @@ class _Research:
                                       temperature=cfg.code_temperature))
 
     # ---------------------------------------------------------------- эксперимент
-    def _evaluate_code(self, code: str, name: str) -> tuple[Candidate | None, str]:
-        """Проверка кода → песочница → проверка признаков → evaluator. (кандидат, "") или (None, ошибка)."""
+    def _evaluate_code(self, code: str, name: str, screen: bool = False) -> tuple[Candidate | None, str]:
+        """Проверка кода → песочница → проверка признаков → [скрининг] → evaluator. (кандидат, "") или (None, ошибка).
+
+        screen=True и есть скрининг: гипотеза, не прошедшая его, — (None, "screen: ...") без полной оценки
+        (это отказ, а не сбой: чинить код не нужно), решение скрининга — в self.screen_decision."""
         cfg = self.cfg
         problems = validate_code(code)
         consts: dict = {}
@@ -1758,6 +1780,12 @@ class _Research:
                                 timeout=min(cfg.features_timeout, max(1.0, self._left())))
         if features.error:
             return None, features.error
+        self.last_features = (features.x_train, features.x_test)
+        self.screen_decision = None
+        if screen and self.screen is not None:
+            verdict = self._screen_check(features)
+            if verdict:
+                return None, verdict
         if self._left() < max(10.0, 0.5 * self.reference_seconds):
             return None, "no time left to evaluate"
         try:
@@ -1772,12 +1800,51 @@ class _Research:
             cand.meta = {}
         cand.meta.update(code=code, model=model, params=params, target_transform=transform,
                          n_features=int(features.x_train.shape[1]), harness_notes=notes + features.notes)
+        if self.screen_decision is not None:
+            cand.meta["screen_gain"] = self.screen_decision.gain
         return cand, ""
+
+    def _screen_reference(self) -> Candidate | None:
+        """Скрининг признаков текущего лучшего кода (кэш по его хэшу); None — посчитать не удалось."""
+        digest = code_hash(self.base_code)
+        if self.screen_ref is not None and self.screen_ref_hash == digest:
+            return self.screen_ref
+        if self.base_features is None:
+            return None
+        start = time.monotonic()
+        budget = _SubDeadline(self.deadline, min(self.cfg.evaluate_timeout, self._left()))
+        self.screen_ref = self.screen(self.spec, make_build_features(*self.base_features), {}, budget)
+        self.screen_ref_hash = digest
+        log.info("research: screen reference (%s) %s=%.5g, %.0fs", getattr(self.screen, "name", "screen"),
+                 self.data.spec_dict["metric"], self.screen_ref.cv_score, time.monotonic() - start)
+        return self.screen_ref
+
+    def _screen_check(self, features: FeatureOutcome) -> str:
+        """Быстрая оценка признаков гипотезы против эталона скрининга. "" — полная оценка нужна (выигрыш больше
+        screen_k · шум, или скрининг не удался); иначе причина отказа "screen: ..."."""
+        cfg = self.cfg
+        start = time.monotonic()
+        try:
+            reference = self._screen_reference()
+            if reference is None:
+                return ""
+            budget = _SubDeadline(self.deadline, min(cfg.evaluate_timeout, self._left()))
+            cand = self.screen(self.spec, make_build_features(features.x_train, features.x_test), {}, budget)
+        except Exception as error:  # скрининг — ускорение, а не обязательный шаг
+            log.info("research: screening failed (%s: %s) — full evaluation", type(error).__name__,
+                     P.clip(str(error), 200))
+            return ""
+        decision = decide(cand, reference, self.greater, replace(cfg, accept_k=cfg.screen_k, min_rel_gain=0.0))
+        self.screen_decision = decision
+        log.info("research: screen %s=%.5g, %s, %.0fs", self.data.spec_dict["metric"], cand.cv_score,
+                 decision.reason, time.monotonic() - start)
+        return "" if decision.accept else f"{SCREEN_REJECT} {decision.reason}"
 
     def _iterate(self, hypothesis: Hypothesis) -> None:
         cfg = self.cfg
         self.iteration += 1
         n = self.iteration
+        self.screen_decision = None
         start, tokens_in, tokens_out = time.monotonic(), self.tokens_in, self.tokens_out
         status, error, digest = "failed", "", ""
         base_code, last_code = self.base_code, None  # база до эксперимента: _judge её заменит при принятии
@@ -1807,7 +1874,10 @@ class _Research:
                     error = (f"same code as experiment #{same.id}" if same is not None
                              else "no change vs the current best code")
                     break
-                cand, error = self._evaluate_code(code, f"exp_{n:02d}")
+                cand, error = self._evaluate_code(code, f"exp_{n:02d}", screen=True)
+                if cand is None and error.startswith(SCREEN_REJECT):
+                    status, decision = "rejected", self.screen_decision
+                    break
                 if cand is not None or repairs >= cfg.max_repairs or self._left() < self._expected_seconds():
                     break
                 repairs += 1
@@ -1818,6 +1888,8 @@ class _Research:
             if cand is not None:
                 decision = decide(cand, self.current, self.greater, cfg)
                 status, error = self._judge(cand, decision, hypothesis, n)
+                if self.screen_decision is not None:
+                    error = f"screen {self.screen_decision.gain:+.4g} passed | {error}"
                 ignored = [note for note in cand.meta.get("harness_notes", []) if note.startswith(CONSTANTS)]
                 if ignored:  # LLM должна узнать, что её MODEL/PARAMS не применились
                     error = f"harness: {'; '.join(ignored)} | {error}"
@@ -1957,6 +2029,7 @@ class _Research:
                          seconds=round(self.reference_seconds, 1))
         self.accepted.append(cand)
         self.current, self.base_code = cand, cand.meta["code"]
+        self.base_features = self.last_features
         self._update_errors()
         return "accepted", decision.reason
 
@@ -1978,7 +2051,8 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
              profile: Callable | None = None,
              guards: GuardFn | None = None,
              data: Any = None,
-             tuner: TuneFn | None = None) -> list[Candidate]:
+             tuner: TuneFn | None = None,
+             screen: EvaluateFn | None = None) -> list[Candidate]:
     """Принятые кандидаты по убыванию качества CV (первый — лучший) или [].
 
     Необязательные аргументы — для тестов и для P1: подменить evaluator/песочницу/профиль
@@ -2007,15 +2081,22 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
         cfg = replace(cfg, model_search=False, auto_model_search=False, auto_tune=False, postprocess=False)
         tuner = None
         no_tuner = True
+        if screen is None and cfg.screen and isinstance(evaluate, RecipeEvaluator):
+            try:
+                screen = ScreenEvaluator(evaluate, seeds=cfg.screen_seeds)
+                log.info("research: screening with %s", screen.name)
+            except ValueError as error:
+                log.info("research: no screening: %s", error)
     else:
         no_tuner = False
+        screen = None
     loop = None
     try:
         loop = _Research(spec, best, llm, deadline, cfg, evaluate=evaluate,
                          run_code=run_code or _optional("sandbox", "run_code") or _local_run_code,
                          profile=profile or _optional("eda", "profile"),
                          guards=guards or _optional("guards", "check_candidate"), data=data,
-                         tuner=None if no_tuner else tuner or _optional("tuning", "tune"))
+                         tuner=None if no_tuner else tuner or _optional("tuning", "tune"), screen=screen)
         return loop.run()
     except LLMUnavailable as error:
         log.warning("research: LLM недоступна (%s) — возвращаем накопленное", P.clip(str(error), 300))

@@ -631,7 +631,10 @@ def _xgb_timer(stop_at: float):
 def _fit_predict(model: str, regression: bool, params: dict, x_tr: pd.DataFrame, y_tr: np.ndarray,
                  x_va: pd.DataFrame, y_va: np.ndarray, x_te: pd.DataFrame, cats: list[str],
                  stop_at: float, early_stopping: int) -> tuple[np.ndarray, np.ndarray, int, list]:
-    """Обучение на фолде; классификация — коды 0..m-1 только присутствующих классов (иначе XGBoost падает)."""
+    """Обучение на фолде; классификация — коды 0..m-1 только присутствующих классов (иначе XGBoost падает).
+
+    early_stopping <= 0 — без ранней остановки: ровно n_estimators/iterations из params (быстрая оценка признаков
+    агентом: остановка по валидации добавляет к сравнению шум выбора итерации)."""
     present = None
     if not regression:
         present = np.unique(y_tr)
@@ -647,8 +650,11 @@ def _fit_predict(model: str, regression: bool, params: dict, x_tr: pd.DataFrame,
         import lightgbm as lgb
         cls = lgb.LGBMRegressor if regression else lgb.LGBMClassifier
         est = cls(**params)
-        est.fit(x_tr, y_tr, eval_set=[(x_es, y_es)],
-                callbacks=[lgb.early_stopping(early_stopping, verbose=False), _lgb_timer(stop_at)])
+        if early_stopping > 0:
+            est.fit(x_tr, y_tr, eval_set=[(x_es, y_es)],
+                    callbacks=[lgb.early_stopping(early_stopping, verbose=False), _lgb_timer(stop_at)])
+        else:
+            est.fit(x_tr, y_tr, callbacks=[_lgb_timer(stop_at)])
         iters = int(est.best_iteration_ or est.n_estimators)
     elif model == "randomforest":  # без ранней остановки: время ограничено числом деревьев
         from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -657,13 +663,23 @@ def _fit_predict(model: str, regression: bool, params: dict, x_tr: pd.DataFrame,
         iters = int(params["n_estimators"])
     elif model == "catboost":
         from catboost import CatBoostClassifier, CatBoostRegressor
-        est = (CatBoostRegressor if regression else CatBoostClassifier)(**params)
-        est.fit(x_tr, y_tr, cat_features=cats or None, eval_set=(x_es, y_es), callbacks=[_CatBoostTimer(stop_at)])
+        if early_stopping > 0:
+            est = (CatBoostRegressor if regression else CatBoostClassifier)(**params)
+            est.fit(x_tr, y_tr, cat_features=cats or None, eval_set=(x_es, y_es), callbacks=[_CatBoostTimer(stop_at)])
+        else:
+            fixed = {k: v for k, v in params.items() if k not in ("od_type", "od_wait", "use_best_model")}
+            est = (CatBoostRegressor if regression else CatBoostClassifier)(**fixed)
+            est.fit(x_tr, y_tr, cat_features=cats or None, callbacks=[_CatBoostTimer(stop_at)])
         iters = int(est.get_best_iteration() or est.tree_count_)
     else:
         from xgboost import XGBClassifier, XGBRegressor
-        est = (XGBRegressor if regression else XGBClassifier)(**params, callbacks=[_xgb_timer(stop_at)])
-        est.fit(x_tr, y_tr, eval_set=[(x_es, y_es)], verbose=False)
+        if early_stopping > 0:
+            est = (XGBRegressor if regression else XGBClassifier)(**params, callbacks=[_xgb_timer(stop_at)])
+            est.fit(x_tr, y_tr, eval_set=[(x_es, y_es)], verbose=False)
+        else:
+            fixed = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
+            est = (XGBRegressor if regression else XGBClassifier)(**fixed, callbacks=[_xgb_timer(stop_at)])
+            est.fit(x_tr, y_tr, verbose=False)
         iters = int(getattr(est, "best_iteration", None) or params["n_estimators"])
 
     if regression:
@@ -693,10 +709,11 @@ class Run:
 
 def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at: float, *,
              transform: str | None = None, extra: dict | None = None, threads: int = 1,
-             exclude: tuple[str, ...] = (), entity: bool = False) -> Run:
+             exclude: tuple[str, ...] = (), entity: bool = False, early_stopping: int | None = None) -> Run:
     """K-fold с фиксированными фолдами: OOF, среднее по фолдам на test, оценка metrics.score на каждом фолде.
 
     entity — добавить признаки по таргету той же сущности (entity_features), считаются внутри каждого фолда.
+    early_stopping — терпение ранней остановки (None — из cfg; 0 — без неё, ровно n_estimators из extra/params).
     """
     start = time.monotonic()
     regression = data.task == "regression"
@@ -726,7 +743,7 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
         p_va, p_te, iters, present = _fit_predict(
             model, regression, params, x_tr, y_tr, x_va,
             np.log1p(data.y[valid_idx]) if transform == "log1p" else data.y[valid_idx], x_te, cats, fold_stop,
-            cfg.early_stopping)
+            cfg.early_stopping if early_stopping is None else early_stopping)
         if regression:
             if transform == "log1p":
                 p_va, p_te = np.expm1(p_va), np.expm1(p_te)
