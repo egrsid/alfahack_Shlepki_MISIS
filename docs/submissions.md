@@ -8,6 +8,8 @@
 |---|---|---|---|---|---|---|
 | 2026-10-21 | `submission_v1.zip` | v0: `solution.py` без агента (LightGBM без CV) | ? | ? | ? | ? |
 | 2026-10-25 | ? (2 отправки, P4) | fallback + агент; агент на одной задаче остановился: на платформе нет pyarrow (исправлено в `main`) | ? | ? | обе задачи завершились | P4 |
+| 2026-10-25 | `submission_v2.zip` = `solution_28f3a4a.zip` (main) | fallback P3 (признаки сущности, честные схемы CV, RandomForest, bag3) + агент «только добавить колонку»; AutoGluon 40 мин | ? | ? | **22.46** (итог; по задачам неизвестно) | P4 |
+| 2026-10-25 | `submission_v3.zip` = `solution_ba2eb64.zip` (`feature/agent-tools`) | + идеи 1–5 и инструменты агента: честное сравнение с fallback, скрининг, сигналы, скрытый фолд, пул, drop/weights/target_stats; AutoML выкл. | ? | ? | ? (не отправлен) | P4 |
 |  |  |  |  |  |  |  |
 
 Локальные CV для сравнения (без LLM, `docs/plans/integration-submission.md`): регрессия 43.29, мультикласс 0.649.
