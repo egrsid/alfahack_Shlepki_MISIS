@@ -169,7 +169,7 @@ def test_n_threads_is_positive():
     assert F.model_threads("xgboost", 87_670, 8) == 4 and F.model_threads("lightgbm", 53_308, 8) == 4
 
 
-@pytest.mark.parametrize("budget_left, expected", [(1000.0, 900.0), (100.0, 80.0), (5.0, 20.0)])
+@pytest.mark.parametrize("budget_left, expected", [(3000.0, 1500.0), (1000.0, 980.0), (100.0, 80.0), (5.0, 20.0)])
 def test_budget_from_deadline(budget_left, expected):
     class Deadline:
         def left(self):
@@ -343,3 +343,32 @@ def test_contract_used_by_team_solution_and_agent_eval(tmp_path):
     shape = types.SimpleNamespace(y=np.empty(600), task="regression", metric="rmse")
     assert F._params("lightgbm", shape, cfg, 2, {})["objective"] == "regression"
     assert F.clearly_better("rmse", reg, reg) is False
+
+
+def test_structural_decisions_need_gain_beyond_noise():
+    def run_(scores):
+        return F.Run("r", "lightgbm", np.zeros(1), np.zeros(1), list(scores), 1.0, {}, None, [1])
+    base = run_([10.0, 12.0, 11.0, 13.0, 9.0])
+    assert F.runs_clearly_better("rmse", run_([9.0, 11.0, 10.0, 12.0, 8.0]), base)  # стабильно лучше на всех фолдах
+    assert not F.runs_clearly_better("rmse", run_([9.0, 13.0, 10.0, 14.0, 8.5]), base)  # в среднем лучше, но шумно
+    assert not F.runs_clearly_better("macro_f1", run_([0.5] * 5), run_([0.6] * 5))
+
+
+def test_seed_bagging_of_final_models(tmp_path):
+    spec, _ = classification_task(tmp_path, n_classes=3)
+    cand = F.run(spec, config=_cfg(bag_seeds=2))
+    assert cand.name.endswith("_bag2") and cand.meta["bagged_seeds"] == 2
+    assert np.allclose(cand.test_pred.sum(axis=1), 1) and submission.check_file(spec) == []
+    out = pd.read_csv(tmp_path / "submission.csv")
+    assert (out["label"].to_numpy() == np.asarray(cand.meta["classes"], dtype=object)[
+        metrics.to_labels(cand.test_pred, cand.meta["decision"])]).all()  # в файле — именно усреднённый кандидат
+
+
+def test_seed_bagging_skipped_without_time(tmp_path):
+    spec, _ = regression_task(tmp_path)
+
+    class Deadline:
+        def left(self):
+            return 30.0
+    cand = F.run(spec, Deadline(), config=_cfg(bag_seeds=3))
+    assert "bagged_seeds" not in cand.meta and submission.check_file(spec) == []
