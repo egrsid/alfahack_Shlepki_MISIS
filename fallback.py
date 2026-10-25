@@ -70,12 +70,14 @@ class HeuristicSpec:
 
 @dataclass
 class FallbackConfig:
-    time_budget: float = 900.0       # потолок на весь fallback, с (план: fallback ≤ T+15 мин)
+    time_budget: float = 1500.0      # потолок на весь fallback, с (25 мин из 3 ч: с запасом на усреднение по сидам)
     reserve: float = 20.0            # не трогаем последние N секунд дедлайна
     n_splits: int = 5
     seed: int = 42                   # тот же сид, что у заглушки evaluator P4: при cv="random" сплиты совпадают
     cv: str = "auto"                 # auto — схема по данным (период / дубли / случайная), random — всегда (Stratified)KFold
-    models: tuple[str, ...] = ("lightgbm", "xgboost", "catboost")  # CatBoost последним: на public медленнее и слабее
+    # CatBoost последним: на public медленнее и слабее. RandomForest — дёшево и ошибается иначе, чем бустинги:
+    # на public-мультиклассе лучший по сырому Macro F1 (0.625), в бленде balanced+XGB 0.6491 → 0.6526
+    models: tuple[str, ...] = ("lightgbm", "xgboost", "randomforest", "catboost")
     max_rounds: int = 5000
     early_stopping: int = 100
     try_log_target: bool = True
@@ -89,6 +91,9 @@ class FallbackConfig:
     job_cap_units: float = 4.0       # потолок времени на модель после первой: N × время первого LightGBM
     entity: bool = True              # признаки по таргету повторяющейся сущности (регрессия/бинарная), берутся по CV
     decision_seconds: float = 40.0
+    # итоговые модели (одиночная или участники бленда) переобучаются с bag_seeds сидами и усредняются: снижает дисперсию
+    # без подгонки под CV (public-регрессия: сиды 42/43/44 — 41.37/41.78/41.86, среднее трёх — 41.31)
+    bag_seeds: int = 3
     write: bool = True
     threads: int | None = None
 
@@ -240,8 +245,11 @@ class TaskData:
     def frame(self, model: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
         key = "lightgbm" if model in ("lightgbm", "xgboost") else model
         if key not in self.frames:
-            x, cats = preprocess.model_frame(self.prep, self.prep.X, key)
-            x_test, _ = preprocess.model_frame(self.prep, self.prep.X_test, key)
+            kind = "sklearn" if key == "randomforest" else key
+            x, cats = preprocess.model_frame(self.prep, self.prep.X, kind)
+            x_test, _ = preprocess.model_frame(self.prep, self.prep.X_test, kind)
+            if key == "randomforest":  # sklearn: только числа, пропуски — отдельным значением
+                x, x_test = x.astype("float32").fillna(-999.0), x_test.astype("float32").fillna(-999.0)
             self.frames[key] = (x, x_test, cats)
         return self.frames[key]
 
@@ -488,7 +496,7 @@ def model_threads(model: str, n_rows: int, threads: int) -> int:
     Замеры (Mac, fallback-LightGBM, одинаковый CV): 3 000 строк — 1 поток 1 с, 15 потоков 25 с;
     87 670 строк × 10 классов — 2/4/8 потоков: 184/152/202 с; 53 308 строк — 13/11/16 с. CatBoost масштабируется хорошо.
     """
-    if model == "catboost":
+    if model in ("catboost", "randomforest"):
         return threads
     return max(1, min(max(1, threads // 2), n_rows // ROWS_PER_THREAD))
 
@@ -517,6 +525,11 @@ def _params(model: str, data: TaskData, cfg: FallbackConfig, threads: int, extra
                       one_hot_max_size=16)
         if regression:
             params["loss_function"] = "MAE" if l1 else "RMSE"
+    elif model == "randomforest":
+        params = dict(n_estimators=300, min_samples_leaf=3 if regression else 2, max_features=0.5 if regression else 0.3,
+                      n_jobs=threads, random_state=cfg.seed)
+        if not regression and metrics.get(data.metric).tunable:
+            params["class_weight"] = "balanced_subsample"
     else:
         params = dict(n_estimators=cfg.max_rounds, learning_rate=_lr(n), max_depth=7, min_child_weight=1.0,
                       subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0, tree_method="hist",
@@ -577,6 +590,11 @@ def _fit_predict(model: str, regression: bool, params: dict, x_tr: pd.DataFrame,
         est.fit(x_tr, y_tr, eval_set=[(x_es, y_es)],
                 callbacks=[lgb.early_stopping(early_stopping, verbose=False), _lgb_timer(stop_at)])
         iters = int(est.best_iteration_ or est.n_estimators)
+    elif model == "randomforest":  # без ранней остановки: время ограничено числом деревьев
+        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+        est = (RandomForestRegressor if regression else RandomForestClassifier)(**params)
+        est.fit(x_tr, y_tr)
+        iters = int(params["n_estimators"])
     elif model == "catboost":
         from catboost import CatBoostClassifier, CatBoostRegressor
         est = (CatBoostRegressor if regression else CatBoostClassifier)(**params)
@@ -606,6 +624,7 @@ class Run:
     iterations: list[int]
     exclude: tuple[str, ...] = ()
     entity: bool = False
+    extra: dict = field(default_factory=dict)
 
     @property
     def cv(self) -> float:
@@ -662,7 +681,7 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
         scores.append(metrics.score(data.metric, data.y[valid_idx], oof[valid_idx]))
         iterations.append(iters)
     return Run(name, model, oof, test_pred, scores, time.monotonic() - start, params, transform, iterations,
-               tuple(exclude), bool(entity and data.entity is not None))
+               tuple(exclude), bool(entity and data.entity is not None), dict(extra or {}))
 
 
 # ---------------------------------------------------------------- бленд и кандидаты
@@ -778,6 +797,21 @@ def make_candidate(data: TaskData, name: str, oof: np.ndarray, test_pred: np.nda
                      oof=oof, test_pred=test_pred, meta=meta)
 
 
+def _paired_gain(metric: str, a: list[float], b: list[float], k: float) -> bool:
+    diff = (np.asarray(a, dtype=float) - np.asarray(b, dtype=float)) * (1.0 if metrics.greater_is_better(metric) else -1.0)
+    if len(diff) < 2:
+        return bool(diff.mean() > 0) if len(diff) else False
+    return bool(diff.mean() > k * diff.std(ddof=1) / np.sqrt(len(diff)))
+
+
+def runs_clearly_better(metric: str, new: "Run", old: "Run", k: float = 1.0) -> bool:
+    """Структурное решение (исключить колонку, лог-таргет, признаки сущности) — только с выигрышем больше шума:
+    иначе на незнакомой задаче случайная разница по CV переключает весь дальнейший пайплайн."""
+    if len(new.fold_scores) != len(old.fold_scores):
+        return metrics.is_better(metric, new.cv, old.cv)
+    return _paired_gain(metric, new.fold_scores, old.fold_scores, k)
+
+
 def clearly_better(metric: str, new: Candidate, old: Candidate, k: float = 1.0) -> bool:
     """Выигрыш по фолдам больше k стандартных ошибок парных разностей (как правило принятия у агента P4)."""
     a = np.asarray(new.meta.get("fold_scores_eff", new.meta.get("fold_scores", [])), dtype=float)
@@ -814,9 +848,10 @@ class _Writer:
         self.spec, self.metric, self.enabled = spec, metric, enabled
         self.best: float | None = None
 
-    def offer(self, cand: Candidate) -> None:
+    def offer(self, cand: Candidate, force: bool = False) -> None:
+        """force — записать, даже если CV не выше (усреднение по сидам: CV одиночного сида содержит его везение)."""
         score = effective_cv(cand)
-        if not self.enabled or not metrics.is_better(self.metric, score, self.best):
+        if not self.enabled or not (force or metrics.is_better(self.metric, score, self.best)):
             return
         try:
             submission.write_candidate(self.spec, cand)
@@ -841,7 +876,7 @@ def _plan(data: TaskData, cfg: FallbackConfig) -> list[tuple[str, str, dict]]:
     return jobs
 
 
-_COST = {"lightgbm": 1.0, "catboost": 2.5, "xgboost": 1.5}
+_COST = {"lightgbm": 1.0, "catboost": 2.5, "xgboost": 1.5, "randomforest": 0.6}
 
 
 def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -> Candidate:
@@ -924,6 +959,36 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
                  data.metric, result.seconds, int(np.mean(result.iterations)))
         return result
 
+    def bag_best() -> Candidate | None:
+        """Итоговые модели (одиночная или участники бленда) с bag_seeds сидами; None — не успеваем или не к чему."""
+        meta = best.meta
+        members = meta.get("members") or {best.name.removeprefix("fallback_"): 1.0}
+        member_runs = [next((r for r in runs if r.name == name), None) for name in members]
+        if any(r is None for r in member_runs):
+            return None
+        need = sum(r.seconds for r in member_runs) * (cfg.bag_seeds - 1)
+        if need > 0.8 * (left() - 15.0 - decision_seconds):
+            log.info("усреднение по сидам пропущено: нужно ~%.0f с, осталось %.0f с", need, left())
+            return None
+        oof, test_pred = 0.0, 0.0
+        for run_, weight in zip(member_runs, members.values()):
+            oofs, tests = [run_.oof], [run_.test_pred]
+            for k in range(1, cfg.bag_seeds):
+                seed_key = "random_seed" if run_.model == "catboost" else "random_state"
+                again = attempt(f"{run_.name}_seed{k}", run_.model, {**run_.extra, seed_key: cfg.seed + k},
+                                run_.transform, 1.0, run_.exclude, entity=run_.entity)
+                if again is None:
+                    return None
+                oofs.append(again.oof)
+                tests.append(again.test_pred)
+            oof = oof + weight * sum(oofs) / len(oofs)
+            test_pred = test_pred + weight * sum(tests) / len(tests)
+        name = f"{best.name}_bag{cfg.bag_seeds}"
+        keep = {k: meta[k] for k in ("model", "params", "target_transform", "excluded", "entity", "members")
+                if k in meta}
+        return make_candidate(data, name, oof, test_pred, _fold_scores(data, oof), {**keep, "bagged_seeds": cfg.bag_seeds},
+                              cfg, min(decision_seconds, left() / 4))
+
     jobs = _plan(data, cfg)
     for i, (name, model, extra) in enumerate(jobs):
         last = i == len(jobs) - 1
@@ -937,25 +1002,25 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
             without = attempt("lightgbm_noperiod", "lightgbm", {}, transform, 0.5, (data.period_feature,))
             if without is not None:
                 accept(without)
-                if metrics.is_better(data.metric, without.cv, result.cv):
+                if runs_clearly_better(data.metric, without, result):
                     excluded, result = (data.period_feature,), without
-                    log.info("без %s лучше по CV — остальные модели учатся без него", data.period_feature)
+                    log.info("без %s лучше по CV больше шума — остальные модели учатся без него", data.period_feature)
         if model == "lightgbm" and not extra and data.entity is not None and not use_entity:
             with_entity = attempt("lightgbm_entity", "lightgbm", {}, transform, 0.5, excluded, entity=True)
             if with_entity is not None:
                 accept(with_entity)
-                if metrics.is_better(data.metric, with_entity.cv, result.cv):
+                if runs_clearly_better(data.metric, with_entity, result):
                     use_entity, result = True, with_entity
-                    log.info("признаки сущности лучше по CV — остальные модели учатся с ними")
+                    log.info("признаки сущности лучше по CV больше шума — остальные модели учатся с ними")
         if (model == "lightgbm" and not extra and data.task == "regression" and transform is None
                 and cfg.try_log_target and data.y.min() >= 0
                 and (data.metric in ("rmsle", "msle", "mape") or pd.Series(data.y).skew() > 0.75)):
             logged = attempt("lightgbm_log", "lightgbm", {}, "log1p", 0.5, excluded)
             if logged is not None:
                 accept(logged)
-                if metrics.is_better(data.metric, logged.cv, result.cv):
+                if runs_clearly_better(data.metric, logged, result):
                     transform = "log1p"
-                    log.info("лог-таргет лучше по CV — остальные модели учатся на log1p")
+                    log.info("лог-таргет лучше по CV больше шума — остальные модели учатся на log1p")
 
     if cfg.blend and len(runs) >= 2 and left() > 5:
         try:
@@ -969,6 +1034,21 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
                           "excluded": list(excluded)}, strict=True)
         except Exception as error:  # noqa: BLE001
             log.warning("бленд упал: %s", error)
+
+    if cfg.bag_seeds > 1 and best is not None and left() > 30:
+        try:
+            bagged = bag_best()
+            if bagged is not None:
+                if clearly_better(data.metric, best, bagged):
+                    log.info("усреднение по сидам: %s cv=%.6g явно хуже %.6g — оставляем одиночный сид", bagged.name,
+                             effective_cv(bagged), effective_cv(best))
+                else:
+                    log.info("усреднение по %d сидам: %s cv=%.6g (одиночный сид %.6g)", cfg.bag_seeds, bagged.name,
+                             effective_cv(bagged), effective_cv(best))
+                    best = bagged
+                    writer.offer(best, force=True)
+        except Exception as error:  # noqa: BLE001 — доводка необязательна, сабмит уже записан
+            log.warning("усреднение по сидам упало: %s: %s", type(error).__name__, str(error)[:300])
 
     if best is None:
         log.error("ни одна модель не обучилась — константный кандидат")
