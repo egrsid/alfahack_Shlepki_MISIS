@@ -136,7 +136,7 @@ def test_code_without_function_and_exceptions_three_failures_stop(reg_task):
                    "coder": [fenced(NO_FUNCTION_CODE), fenced(NO_FUNCTION_CODE),
                              fenced(EXCEPTION_CODE), fenced(EXCEPTION_CODE),
                              "no code here", "still no code", fenced(GOOD_CODE)]})
-    result, _, _ = run_research(reg_task, llm)
+    result, _, _ = run_research(reg_task, llm, max_consecutive_failures=3)
     rows = experiments(reg_task)
     assert result == [] and llm.count("coder") == 6
     assert [r["status"] for r in rows] == ["failed"] * 3

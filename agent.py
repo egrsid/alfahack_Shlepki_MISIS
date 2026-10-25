@@ -97,6 +97,16 @@ class AgentConfig:
     # правило принятия
     accept_k: float = 1.0               # gain > accept_k · SE шума CV
     min_rel_gain: float = 5e-4          # и gain > min_rel_gain · |cv лучшего|
+    min_fold_wins: float = 0.0          # и лучше хотя бы на этой доле фолдов (парно); режим рецепта — recipe_fold_wins
+    # защита от переобучения под CV многими гипотезами (режим рецепта): порог растёт с числом полных оценок,
+    # скрытый фолд (evaluate.holdout_fold) не участвует в решениях и в промптах; в конце принятые шаги остаются,
+    # только если улучшают и его
+    accept_k_step: float = 0.25         # + к accept_k за каждые accept_k_every полных оценок ...
+    accept_k_every: int = 10
+    accept_k_max: float = 2.0           # ... но не выше
+    recipe_fold_wins: float = 0.6
+    holdout: bool = True
+    holdout_min_gain: float = 0.0       # выигрыш на скрытом фолде против эталона рецепта должен быть больше
     default_n_folds: int = 5            # если evaluator не отдал fold_scores
     suspicious_k: float = 8.0           # «чудесный» скачок: gain > suspicious_k · SE ...
     suspicious_rel: float = 0.1         # ... и > 10% от |cv| → перепроверка guards
@@ -1104,9 +1114,11 @@ def decide(new: Candidate, current: Candidate, greater_is_better: bool, cfg: Age
     gain = sign * (new_score - cur_score)
 
     ours, theirs = _fold_scores(new), _fold_scores(current)
+    wins = None
     if ours is not None and theirs is not None and len(ours) == len(theirs) >= 2:
         diffs = sign * (ours - theirs)
         noise, source = float(np.std(diffs, ddof=1) / math.sqrt(len(diffs))), "paired folds"
+        wins = (int((diffs > 0).sum()), len(diffs))
     else:
         folds = len(theirs) if theirs is not None else cfg.default_n_folds
         std = float(current.cv_std) if math.isfinite(float(current.cv_std)) else 0.0
@@ -1114,9 +1126,28 @@ def decide(new: Candidate, current: Candidate, greater_is_better: bool, cfg: Age
 
     threshold = max(cfg.accept_k * noise, cfg.min_rel_gain * abs(cur_score))
     accept = gain > threshold
-    suspicious = accept and gain > cfg.suspicious_k * noise and gain > cfg.suspicious_rel * abs(cur_score)
     reason = f"gain {gain:+.5g} {'>' if accept else '<='} threshold {threshold:.5g} (noise {noise:.3g}, {source})"
+    if wins is not None and cfg.min_fold_wins > 0:
+        enough = wins[0] >= math.ceil(cfg.min_fold_wins * wins[1] - 1e-9)
+        reason += f", better on {wins[0]}/{wins[1]} folds" + ("" if enough else " (too few)")
+        accept = accept and enough
+    suspicious = accept and gain > cfg.suspicious_k * noise and gain > cfg.suspicious_rel * abs(cur_score)
     return Decision(accept, gain, threshold, noise, suspicious, reason)
+
+
+def _without_fold(cand: Any, fold: int | None) -> Any:
+    """Кандидат для решений агента без скрытого фолда: оценка и fold_scores — по остальным фолдам."""
+    scores = _fold_scores(cand) if fold is not None and cand is not None else None
+    if scores is None or not 0 <= fold < len(scores) or len(scores) < 3:
+        return cand
+    search = np.delete(scores, fold)
+    return types.SimpleNamespace(name=cand.name, cv_score=float(np.mean(search)), cv_std=float(np.std(search)),
+                                 oof=getattr(cand, "oof", None), meta={"fold_scores": [float(v) for v in search]})
+
+
+def _fold_score(cand: Any, fold: int) -> float | None:
+    scores = _fold_scores(cand)
+    return float(scores[fold]) if scores is not None and 0 <= fold < len(scores) else None
 
 
 # ============================================================ время, токены, вызовы LLM
@@ -1344,6 +1375,10 @@ class _Research:
         self.last_features: tuple[pd.DataFrame, pd.DataFrame] | None = None   # признаки последней оценки
         self.signals = signals            # что уже делает fallback, важности, дрейф (agent_eval.recipe_signals)
         self.rank_cache: dict = {}        # ранги исходных колонок для useless_new_columns
+        # скрытый фолд: решения, промпты и анализ ошибок — без него; проверка принятых — в конце (_holdout_check)
+        self.hidden = (getattr(evaluate, "holdout_fold", None)
+                       if cfg.holdout and getattr(evaluate, "recipe_mode", False) else None)
+        self.full_evals = 0
         self.filter_notes: list[str] = []
         self.greater = bool(getattr(spec, "greater_is_better", False))
         self.memory = ExperimentMemory()
@@ -1372,9 +1407,11 @@ class _Research:
                 self._loop()
             except LLMUnavailable:
                 self.stop_reason = "LLM unavailable"
+                self._holdout_check()
                 self.finalize()  # без LLM; до _finish — пока входные таблицы песочницы на диске
                 raise
             self.postprocess()
+            self._holdout_check()
             self.finalize()
             return self.result()
         finally:
@@ -1468,6 +1505,36 @@ class _Research:
         except Exception as error:  # постобработка — бонус, а не обязательный шаг
             log.warning("research: postprocess failed: %s: %s", type(error).__name__, P.clip(str(error), 300))
 
+    def _holdout_check(self) -> None:
+        """Конец исследования: принятые шаги остаются, только если улучшают и скрытый фолд (против эталона рецепта).
+
+        Решения принимались без него, поэтому выигрыш, подобранный под остальные фолды многими гипотезами, здесь
+        не помогает. Не прошёл никто — результата агента нет (в файле остаётся fallback); лучший из прошедших —
+        текущий (его и доводит finalize).
+        """
+        cfg = self.cfg
+        if self.hidden is None or not self.accepted or self.best is None:
+            return
+        reference = _fold_score(self.best, self.hidden)
+        if reference is None:
+            return
+        sign = 1.0 if self.greater else -1.0
+        survivors = []
+        for cand in self.accepted:
+            score = _fold_score(cand, self.hidden)
+            gain = sign * (score - reference) if score is not None else math.nan
+            ok = math.isfinite(gain) and gain > cfg.holdout_min_gain
+            log.info("research: hidden fold %d: %s %s=%.5g vs reference %.5g (%+.4g) → %s", self.hidden, cand.name,
+                     self.data.spec_dict["metric"], score if score is not None else math.nan, reference, gain,
+                     "kept" if ok else "dropped")
+            if ok:
+                survivors.append(cand)
+        if not survivors:
+            log.warning("research: none of %d accepted steps improves the hidden fold — agent results discarded",
+                        len(self.accepted))
+        self.accepted = survivors
+        self.current = max(survivors, key=lambda c: sign * float(c.cv_score)) if survivors else self.best
+
     def finalize(self) -> None:
         """Конец исследования поверх рецепта fallback: лучший принятый кандидат переобучается с теми же сидами, что
         итог fallback (evaluate.bag, bag_seeds), и добавляется к принятым.
@@ -1480,8 +1547,8 @@ class _Research:
         bag = getattr(self.evaluate, "bag", None)
         seeds = int(getattr(self.evaluate, "bag_seeds", 1) or 1)
         current = self.current
-        if (not cfg.bag_best or not self.recipe or seeds <= 1 or not callable(bag) or not self.accepted
-                or current is not self.accepted[-1] or (current.meta or {}).get("bagged_seeds")):
+        if (not cfg.bag_best or not self.recipe or seeds <= 1 or not callable(bag)
+                or not any(c is current for c in self.accepted) or (current.meta or {}).get("bagged_seeds")):
             return
         deadline = _FinalDeadline(self.deadline, cfg.final_reserve_seconds)
         need = (seeds - 1) * self.reference_seconds * 1.25
@@ -1600,8 +1667,14 @@ class _Research:
             return
         start = time.monotonic()
         meta = getattr(self.current, "meta", None) or {}
+        x, y, oof = self.data.train_x, self.data.y, getattr(self.current, "oof", None)
+        fold_ids = meta.get("fold_ids")
+        if self.hidden is not None and fold_ids is not None and oof is not None and len(fold_ids) == len(x) == len(oof):
+            seen = np.asarray(fold_ids) != self.hidden  # строки скрытого фолда LLM не показываем даже агрегатами
+            x, oof = x[seen], np.asarray(oof)[seen]
+            y = y[seen] if isinstance(y, pd.Series) else np.asarray(y)[seen]
         self.errors_text = analyze_errors(
-            self.data.train_x, self.data.y, getattr(self.current, "oof", None), self.task_type,
+            x, y, oof, self.task_type,
             classes=meta.get("classes"), cat_cols=self.data.spec_dict["cat_cols"], max_chars=self.cfg.errors_chars)
         log.info("research: error analysis %s in %.1fs", "updated" if self.errors_text else "unavailable",
                  time.monotonic() - start)
@@ -1694,7 +1767,19 @@ class _Research:
             self.llm_calls += 1
 
     def _cv_text(self) -> str:
-        return f"CV {self.data.spec_dict['metric']} = {float(self.current.cv_score):.5g}"
+        return f"CV {self.data.spec_dict['metric']} = {float(self._view(self.current).cv_score):.5g}"
+
+    def _view(self, cand: Any) -> Any:
+        """Кандидат, каким его видят решения и промпты агента: без скрытого фолда."""
+        return _without_fold(cand, self.hidden)
+
+    def _accept_cfg(self) -> AgentConfig:
+        """Правило принятия сейчас: в режиме рецепта порог растёт с числом полных оценок + доля выигранных фолдов."""
+        cfg = self.cfg
+        if not self.recipe:
+            return cfg
+        k = min(cfg.accept_k_max, cfg.accept_k + cfg.accept_k_step * (self.full_evals // max(1, cfg.accept_k_every)))
+        return replace(cfg, accept_k=max(cfg.accept_k, k), min_fold_wins=max(cfg.min_fold_wins, cfg.recipe_fold_wins))
 
     def _plan(self) -> None:
         cfg = self.cfg
@@ -1893,7 +1978,8 @@ class _Research:
             log.info("research: screening failed (%s: %s) — full evaluation", type(error).__name__,
                      P.clip(str(error), 200))
             return ""
-        decision = decide(cand, reference, self.greater, replace(cfg, accept_k=cfg.screen_k, min_rel_gain=0.0))
+        decision = decide(self._view(cand), self._view(reference), self.greater,
+                          replace(cfg, accept_k=cfg.screen_k, min_rel_gain=0.0, min_fold_wins=0.0))
         self.screen_decision = decision
         log.info("research: screen %s=%.5g, %s, %.0fs", self.data.spec_dict["metric"], cand.cv_score,
                  decision.reason, time.monotonic() - start)
@@ -1945,7 +2031,9 @@ class _Research:
                     error += " | repair answer has no code block"
                 code = fixed
             if cand is not None:
-                decision = decide(cand, self.current, self.greater, cfg)
+                accept_cfg = self._accept_cfg()
+                self.full_evals += 1
+                decision = decide(self._view(cand), self._view(self.current), self.greater, accept_cfg)
                 status, error = self._judge(cand, decision, hypothesis, n)
                 if self.screen_decision is not None:
                     error = f"screen {self.screen_decision.gain:+.4g} passed | {error}"
@@ -1966,7 +2054,7 @@ class _Research:
         changed = code_diff(base_code, last_code, max_lines=0) if last_code else ""
         self.memory.add(Experiment(
             id=self.memory.next_id(), hypothesis=hypothesis.title, kind=hypothesis.kind, status=status,
-            cv_score=float(cand.cv_score) if cand is not None else None,
+            cv_score=float(self._view(cand).cv_score) if cand is not None else None,
             cv_std=float(cand.cv_std) if cand is not None else None,
             gain=decision.gain if decision is not None else None, code_hash=digest, error=error[:1000],
             duration_s=round(duration, 1), tokens_in=self.tokens_in - tokens_in,

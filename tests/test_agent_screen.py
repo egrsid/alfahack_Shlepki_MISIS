@@ -34,7 +34,8 @@ def test_fixed_rounds_without_early_stopping(task):
 def test_screen_is_deterministic_and_sees_useful_columns(task):
     spec, best = task
     screen = agent_eval.ScreenEvaluator(agent_eval.RecipeEvaluator(best, threads=2), seeds=2)
-    assert screen.run.name in best.meta["context"].members and screen.rounds >= 50
+    runs = [r for r in best.meta["context"].runs if r.model == "lightgbm"]
+    assert screen.run is min(runs, key=lambda r: r.cv) and 50 <= screen.rounds <= 300  # лучший LightGBM по RMSE
     first, again = screen(spec, identity_features), screen(spec, identity_features)
     assert first.meta["fold_scores"] == again.meta["fold_scores"]  # общие сиды: эталон воспроизводится точно
     better = screen(spec, with_x1_x2)

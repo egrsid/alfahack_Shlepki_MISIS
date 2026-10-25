@@ -351,6 +351,25 @@ def _safe_name(name: str) -> str:
     return "agent__" + (re.sub(r"[^\w]", "_", str(name)).strip("_") or "col")
 
 
+def holdout_fold(data: Any) -> int | None:
+    """Фолд, который агент не видит при решениях (защита от переобучения под CV многими гипотезами).
+
+    Схема «по периодам» — фолд самого позднего периода (он ближе всего к test — новому периоду), иначе последний
+    фолд. Фолдов меньше 4 — None: без одного фолда сравнивать не на чем.
+    """
+    n = int(getattr(data, "n_splits", 0) or 0)
+    folds = getattr(data, "folds", None)
+    if n < 4 or folds is None:
+        return None
+    order = getattr(data, "period_order", None)
+    if (getattr(data, "cv_scheme", None) or {}).get("kind") == "period" and order is not None:
+        order = np.where(np.isfinite(np.asarray(order, dtype=float)), np.asarray(order, dtype=float), np.nan)
+        means = [np.nanmean(order[folds == f]) if np.isfinite(order[folds == f]).any() else -np.inf
+                 for f in range(n)]
+        return int(np.argmax(means))
+    return n - 1
+
+
 class RecipeEvaluator:
     """evaluator.evaluate(spec, build_features, cfg, deadline) -> Candidate на рецепте лучшего кандидата fallback.
 
@@ -385,6 +404,7 @@ class RecipeEvaluator:
         self.fold_members = fold_members if fold_members and names <= set(self.runs) else None
         self.base_oofs = {r.name: r.oof for r in ctx.runs}
         self.bag_seeds = int((getattr(best, "meta", None) or {}).get("bagged_seeds") or 1)
+        self.holdout_fold = holdout_fold(ctx.data)
         self.threads = threads
         self.calls = 0
         self._inputs: tuple[pd.DataFrame, pd.DataFrame, dict] | None = None
@@ -517,9 +537,10 @@ class RecipeEvaluator:
 
 
 class ScreenEvaluator:
-    """Быстрая оценка гипотезы перед полной (RecipeEvaluator): один LightGBM рецепта fallback на тех же матрицах,
-    фолдах, признаках сущности и исключениях, но с фиксированным числом деревьев (медиана итераций этого LightGBM у
-    fallback, без ранней остановки) и с несколькими сидами (по умолчанию 2), усреднёнными на OOF.
+    """Быстрая оценка гипотезы перед полной (RecipeEvaluator): лучший по CV LightGBM fallback на тех же матрицах,
+    фолдах, признаках сущности и исключениях, но с фиксированным числом деревьев (медиана его итераций у fallback, не
+    больше max_rounds — с пропорционально большим шагом; без ранней остановки) и с несколькими сидами (по умолчанию
+    2), усреднёнными на OOF.
 
     Зачем: полная оценка переобучает все члены бленда (2–5 мин на гипотезу), а новая колонка меняет обучение деревьев
     почти как смена сида — шум сравнения порядка самого выигрыша. Скрининг в разы быстрее, а общие сиды у эталона и
@@ -530,24 +551,30 @@ class ScreenEvaluator:
     (без порога/весов классов: им нужны вероятности бленда, а для отсева достаточно сравнения моделей).
     """
 
-    def __init__(self, recipe: RecipeEvaluator, seeds: int = 2, min_rounds: int = 50,
+    def __init__(self, recipe: RecipeEvaluator, seeds: int = 2, max_rounds: int = 300, min_rounds: int = 50,
                  threads: int | None = None) -> None:
+        import fallback
+
         runs = [r for r in recipe.ctx.runs if r.model == "lightgbm" and r.iterations]
         if not runs:
             raise ValueError("fallback has no trained LightGBM to screen with")
-        members = [r for r in runs if r.name in recipe.members]
-        # LightGBM из рецепта (самый весомый) — иначе лучший LightGBM fallback по CV
+        # лучший по CV LightGBM fallback (с признаками сущности, исключениями, весами классов — как он учился):
+        # самый весомый в рецепте бывает слабым (public-регрессия: lightgbm_noperiod 44.7 без сущности при 41.8)
         sign = 1.0 if _greater(recipe.ctx.data.metric) else -1.0
-        self.run = (max(members, key=lambda r: recipe.members[r.name]) if members
-                    else max(runs, key=lambda r: sign * r.cv))
-        self.rounds = max(min_rounds, int(np.median(self.run.iterations)))
+        self.run = max(runs, key=lambda r: sign * r.cv)
+        # число деревьев — как у этого LightGBM, но не больше max_rounds: шаг обучения растёт пропорционально
+        # (public-регрессия: 1276 деревьев на скрининг — дольше полного рецепта)
+        rounds = max(min_rounds, int(np.median(self.run.iterations)))
+        self.rounds = min(rounds, max_rounds)
+        base_lr = float(self.run.params.get("learning_rate", fallback._lr(len(recipe.ctx.data.y))))
+        self.learning_rate = min(0.3, base_lr * rounds / self.rounds)
         self.recipe, self.seeds = recipe, max(1, int(seeds))
         self.threads = threads or recipe.threads
         self.calls = 0
 
     @property
     def name(self) -> str:
-        return f"{self.run.name}, {self.rounds} trees, {self.seeds} seeds"
+        return f"{self.run.name}, {self.rounds} trees, lr {self.learning_rate:.3g}, {self.seeds} seeds"
 
     def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
         import fallback
@@ -563,7 +590,7 @@ class ScreenEvaluator:
                 raise TimeoutError("screening stopped: no time left")
             stop_at = time.monotonic() + (left / (self.seeds - seed) if math.isfinite(left) else 1e9)
             extra = {**(getattr(run, "extra", None) or {}), "n_estimators": self.rounds,
-                     **fallback.seed_params(run.model, ctx.config.seed + seed)}
+                     "learning_rate": self.learning_rate, **fallback.seed_params(run.model, ctx.config.seed + seed)}
             fitted = fallback.cv_model(data, f"screen_{run.name}", run.model, ctx.config, stop_at,
                                        transform=run.transform, extra=extra, threads=threads, exclude=run.exclude,
                                        entity=run.entity, early_stopping=0)
