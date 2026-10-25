@@ -49,6 +49,11 @@ AGENT_WINDOW = 3300.0             # окно агента до RESEARCH_END (з�
 AGENT_FINISH = 1200.0             # доводка агента до сидов — не позже RESEARCH_END + это (T+2:25)
 FINAL_RESERVE = 1200.0            # последние 20 минут: финальный бленд, запись и проверка файла (зоопарк B — до них)
 FINAL_SECONDS = float(TOTAL_SECONDS)  # потолок одного этапа зоопарка, SOLUTION_FINAL_SECONDS (0 — зоопарк выкл.)
+# test — новый период: финальный бленд (веса по поздним периодам, новые уровни) пишется, если он не хуже fallback
+# больше шума, а не только «лучше больше шума». Копия public-регрессии «годы 1–4 → год 5»: бленд на годе 5 лучше
+# (29.91 против 30.30, по всем строкам 42.7 против 49.7), а честное CV по поздним фолдам — хуже (37.68 против 36.84):
+# при 4–5 периодах веса фолда подбираются по 1–2 годам, и CV тут шумнее, чем выигрыш. Осознанный риск.
+PERIOD_BLEND_NONINFERIOR = True
 
 
 class Deadline:
@@ -191,6 +196,16 @@ def pick(spec: Any, current: Any, options: list, trusted: Any, stage: str) -> An
     sign = 1.0 if metrics.greater_is_better(spec.metric) else -1.0
     views = sorted(((c, on_folds(fallback.honest_view(c), folds)) for c in options),
                    key=lambda cv: -sign * fallback.effective_cv(cv[1]))
+    if folds and PERIOD_BLEND_NONINFERIOR:
+        base = on_folds(fallback.honest_view(trusted), folds)
+        for cand, view in views:
+            meta = getattr(cand, "meta", None) or {}
+            if (meta.get("blend") and meta.get("honest_oof") and not fallback.clearly_better(spec.metric, base, view)
+                    and not suspicious(spec, cand, trusted)):
+                log.info("%s: бленд %s cv=%.6g не хуже fallback (%.6g) больше шума на фолдах поздних периодов %s — "
+                         "пишется (test — новый период)", stage, cand.name, fallback.effective_cv(view),
+                         fallback.effective_cv(base), folds)
+                return cand
     good = [(c, v) for c, v in views
             if fallback.clearly_better(spec.metric, v, ref) and not suspicious(spec, c, trusted)]
     if not good:

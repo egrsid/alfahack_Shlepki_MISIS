@@ -86,3 +86,26 @@ def test_pick_compares_period_tasks_on_recent_folds(tmp_path):
                                       "cv_score_post": None})
     better_late.meta["cv_score_post"] = float(np.mean(better_late.meta["fold_scores_eff"]))
     assert solution.pick(spec, best, [better_late], best, "test") is better_late
+
+
+def test_period_blend_is_written_unless_clearly_worse_than_fallback(tmp_path):
+    import solution
+
+    spec = period_task(tmp_path / "reg")
+    best = fallback.run(spec, None, TWO)
+    folds = ensemble.recent_folds(best.meta, len(best.oof))
+    scores = list(fallback.honest_view(best).meta["fold_scores_eff"])
+
+    def blend_like(factors):
+        eff = [s * factors.get(i, 1.0) for i, s in enumerate(scores)]
+        return fallback.Candidate("ensemble", float(np.mean(eff)), 0.0, best.oof, best.test_pred,
+                                  {**best.meta, "honest": None, "blend": {"a": 0.5, "b": 0.5}, "honest_oof": True,
+                                   "fold_scores": eff, "fold_scores_eff": eff, "cv_score_post": float(np.mean(eff))})
+
+    noisy = blend_like({folds[0]: 1.03, folds[1]: 0.99})   # чуть хуже в среднем, но в пределах шума
+    assert solution.pick(spec, best, [noisy], best, "test") is noisy
+    worse = blend_like({i: 1.3 for i in folds})             # явно хуже на поздних фолдах
+    assert solution.pick(spec, best, [worse], best, "test") is None
+    single = blend_like({folds[0]: 1.03, folds[1]: 0.99})
+    single.meta.pop("blend")                                 # не бленд — только строгое правило
+    assert solution.pick(spec, best, [single], best, "test") is None
