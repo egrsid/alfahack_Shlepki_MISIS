@@ -131,3 +131,52 @@ def test_filter_notes_do_not_leak_into_the_next_experiment(task):
     rows = experiments(spec)
     assert "duplicates" in rows[0]["error"] and rows[1]["kind"] == "drop"
     assert "duplicates" not in rows[1]["error"]
+
+
+def _stub(data, **cfg):
+    loop = object.__new__(agent._Research)
+    loop.cfg, loop.recipe, loop.recipe_state = agent.AgentConfig(**cfg), True, {}
+    loop.evaluate = types.SimpleNamespace(ctx=types.SimpleNamespace(data=data))
+    loop.data = types.SimpleNamespace(train_x=pd.DataFrame({"a": [1]}))
+    return loop
+
+
+def test_harness_suggests_tools_from_data_facts():
+    y = np.array([0] * 30 + [1] * 3)
+    rows = pd.DataFrame({"a": [1] * 20 + list(range(13))})  # 20 одинаковых строк
+    dup = types.SimpleNamespace(cv_scheme={"kind": "duplicates"}, task="binary", classes=["n", "x"], y=y,
+                                metric="macro_f1", prep=types.SimpleNamespace(X=rows), period_order=None)
+    tools = _stub(dup).suggested_tools()
+    assert [(h.kind, h.action["scheme"]) for h in tools] == [("weights", "dedup"), ("weights", "class")]
+    assert tools[1].action["power"] == 0.5 and "harness suggestion" in tools[0].rationale
+    period = types.SimpleNamespace(cv_scheme={"kind": "period"}, task="regression", classes=None, y=np.arange(6.0),
+                                   metric="rmse", prep=types.SimpleNamespace(X=pd.DataFrame({"a": range(6)})),
+                                   period_order=np.array([1, 1, 2, 2, 3, 3]))
+    assert [h.action["scheme"] for h in _stub(period).suggested_tools()] == ["recency"]
+    plain = types.SimpleNamespace(cv_scheme={"kind": "random"}, task="regression", classes=None, y=np.arange(6.0),
+                                  metric="rmse", prep=types.SimpleNamespace(X=pd.DataFrame({"a": range(6)})),
+                                  period_order=None)
+    assert _stub(plain).suggested_tools() == []
+    assert _stub(dup, suggest_tools=False).suggested_tools() == []
+    accuracy = types.SimpleNamespace(**{**vars(dup), "cv_scheme": {"kind": "random"}, "metric": "roc_auc"})
+    assert _stub(accuracy).suggested_tools() == []  # AUC — не метрика по меткам: веса классов не предлагаются
+
+
+def test_suggested_tools_run_first_without_llm_code(tmp_path):
+    from p3_fixtures import Spec, write_task
+    rng = np.random.default_rng(1)
+    base = pd.DataFrame({"x": rng.integers(0, 30, 300), "z": rng.integers(0, 3, 300)})
+    train = pd.concat([base] * 3, ignore_index=True)  # каждая строка трижды, в test близнецов нет
+    train["label"] = np.where(train.x > 15, "a", "b")
+    train.insert(0, "id", range(len(train)))
+    test = pd.DataFrame({"id": range(900, 1000), "x": rng.integers(0, 30, 100) + 0.5, "z": 1})
+    write_task(tmp_path, train, test, pd.DataFrame({"id": test.id, "label": "a"}))
+    spec = Spec(tmp_path, "id", "label", "binary", "accuracy")
+    best = fallback.run(spec, None, ONE)
+    assert best.meta["cv_scheme"]["kind"] == "duplicates"
+    llm = MockLLM({"planner": [RuntimeError("planner is down")] * 3})
+    agent.research(spec, best, llm, SimpleDeadline(1200), evaluate=agent_eval.RecipeEvaluator(best, threads=2),
+                   config=agent.AgentConfig(**{**FAST, "max_iters": 1, "screen": False}))
+    rows = experiments(spec)
+    assert rows[0]["kind"] == "weights" and rows[0]["diff"] == 'action weights: {"power": 1.0, "scheme": "dedup"}'
+    assert rows[0]["status"] in ("accepted", "rejected") and llm.count("coder") == 0

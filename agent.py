@@ -116,6 +116,11 @@ class AgentConfig:
     # (только бленд, не отдельный сабмит); «почти принятые» (выигрыш > 0, но ниже порога) — объединяются в гипотезу
     pool_size: int = 5
     combine_near_misses: int = 2        # столько «почти принятых» → гипотеза «объединить их» (0 — выкл.)
+    # режим рецепта: инструменты, которые по фактам о данных почти наверняка стоит проверить, — первыми в очереди
+    # (дубли в train → weights dedup; дисбаланс + метрика по меткам → weights class; новый период → weights recency).
+    # Живой прогон на public-мультиклассе: за 8 гипотез Qwen до них не дошёл при 45% дублей в train
+    suggest_tools: bool = True
+    suggest_imbalance: float = 5.0      # max/min размера класса, с которого предлагаются веса классов
     default_n_folds: int = 5            # если evaluator не отдал fold_scores
     suspicious_k: float = 8.0           # «чудесный» скачок: gain > suspicious_k · SE ...
     suspicious_rel: float = 0.1         # ... и > 10% от |cv| → перепроверка guards
@@ -1494,6 +1499,7 @@ class _Research:
             self._prepare()
             if not self._init_reference():
                 return []
+            self._queue_suggested_tools()
             try:
                 self._loop()
             except LLMUnavailable:
@@ -1507,6 +1513,51 @@ class _Research:
             return self.result()
         finally:
             self._finish()
+
+    def suggested_tools(self) -> list[Hypothesis]:
+        """Действия над рецептом, которые следуют из фактов о данных fallback (схема CV, дисбаланс классов) — не из
+        догадки LLM: дубли в train при их отсутствии в test → веса dedup; дисбаланс ≥ suggest_imbalance:1 при метрике
+        по меткам → веса классов (power 0.5); test — новый период → веса recency. Проходят ту же проверку
+        (action_state), скрининг, решение и скрытый фолд, что и гипотезы LLM; кодер не нужен."""
+        if not (self.cfg.suggest_tools and self.recipe):
+            return []
+        data = getattr(getattr(self.evaluate, "ctx", None), "data", None)
+        if data is None:
+            return []
+        scheme = (getattr(data, "cv_scheme", None) or {}).get("kind")
+        ideas = []
+        if scheme == "duplicates":
+            ideas.append(("Down-weight duplicated train rows (dedup weights)", {"scheme": "dedup", "power": 1.0},
+                          "many train rows are exact duplicates while test rows rarely have twins in train"))
+        if data.task != "regression" and getattr(data, "classes", None):
+            try:
+                import metrics
+                tunable = bool(metrics.get(data.metric).tunable)
+            except Exception:
+                tunable = False
+            counts = np.bincount(np.asarray(data.y, dtype=int))
+            counts = counts[counts > 0]
+            if tunable and len(counts) > 1 and counts.max() / counts.min() >= self.cfg.suggest_imbalance:
+                ideas.append(("Soft class-balanced weights (sqrt)", {"scheme": "class", "power": 0.5},
+                              f"class imbalance {counts.max() / counts.min():.0f}:1 and a label metric"))
+        if scheme == "period" and getattr(data, "period_order", None) is not None:
+            ideas.append(("Weight recent periods higher (recency weights)", {"scheme": "recency", "power": 1.0},
+                          "test is a new period: later periods are closer to it"))
+        out = []
+        for title, action, why in ideas:
+            state, error = action_state("weights", action, self.recipe_state, list(self.data.train_x.columns), data)
+            if state is not None:
+                out.append(Hypothesis(title=title, kind="weights", rationale=f"harness suggestion: {why}",
+                                      expected_gain="high", cost="low", action=action))
+            else:
+                log.info("research: suggested tool %s skipped: %s", title, error)
+        return out
+
+    def _queue_suggested_tools(self) -> None:
+        tools = self.suggested_tools()
+        if tools:
+            self.queue.extend(tools)
+            log.info("research: queued suggested tools first: %s", "; ".join(h.title for h in tools))
 
     def _loop(self) -> None:
         while True:
