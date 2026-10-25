@@ -92,6 +92,19 @@ def test_unknown_metric():
     ("Evaluation: ROC-AUC on the hidden test set", "roc_auc"),
     ("Решения сравниваются по коэффициенту детерминации", "r2"),
     ("Описание без метрики", None),
+    # метрика только кодом sklearn — так она записана в task.md организаторов
+    ("Метрика оценки:\n```python\nmean_absolute_error(y_true, y_pred)\n```", "mae"),
+    ("Метрика оценки:\n```python\nr2_score(y_true, y_pred)\n```", "r2"),
+    ("Метрика:\n```python\naccuracy_score(y_true, y_pred)\n```", "accuracy"),
+    ("Метрика:\n```python\nf1_score(y_true, y_pred, average=\"weighted\")\n```", "weighted_f1"),
+    ("Основная метрика — **Macro F1**:\n```python\nf1_score(y_true, y_pred, average=\"macro\")\n```", "macro_f1"),
+    ("Метрика:\n```python\nmean_squared_error(y_true, y_pred, squared=False)\n```", "rmse"),
+    ("Метрика:\n```python\nroot_mean_squared_error(y_true, y_pred)\n```", "rmse"),
+    ("Метрика:\n```python\nmean_squared_log_error(y_true, y_pred) ** 0.5\n```", "rmsle"),
+    ("Метрика:\n```python\ncohen_kappa_score(y_true, y_pred, weights=\"quadratic\")\n```", "qwk"),
+    ("Метрика:\n```python\nmedian_absolute_error(y_true, y_pred)\n```", "medae"),
+    ("Качество оценивается по площади под ROC-кривой.", "roc_auc"),
+    ("Признак avg_auc_score_x. Метрика оценки — **RMSE**.", "rmse"),
 ])
 def test_find_in_text(text, expected):
     assert M.find_in_text(text) == expected

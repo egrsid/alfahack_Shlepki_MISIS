@@ -218,35 +218,44 @@ def is_better(name: str, new: float, old: float | None, eps: float = 0.0) -> boo
 
 # ---------------------------------------------------------------- метрика в тексте задачи
 
+# границы слова, для которых «_» — разделитель: имена функций sklearn в task.md (mean_absolute_error, r2_score)
+_B, _E = r"(?<![^\W_])", r"(?![^\W_])"
+_ARGS = r"\([^)]*"  # аргументы вызова до закрывающей скобки: f1_score(y_true, y_pred, average="macro")
+
 _TEXT_PATTERNS: list[tuple[str, str]] = [  # порядок важен только для одинаковых позиций
-    ("rmsle", r"\brmsle\b|root[\s-]*mean[\s-]*squared[\s-]*log(arithmic)?[\s-]*error"),
-    ("msle", r"\bmsle\b|mean[\s-]*squared[\s-]*log(arithmic)?[\s-]*error"),
-    ("rmse", r"\brmse\b|root[\s-]*mean[\s-]*squared[\s-]*error|корень\s+из\s+средн\w*\s+квадрат\w*"
-             r"|среднеквадратичн\w*\s+(ошибк|отклонени)\w*"),
-    ("mse", r"\bmse\b|mean[\s-]*squared[\s-]*error|средн\w*\s+квадрат\w*\s+ошибк\w*"),
-    ("smape", r"\bsmape\b|symmetric\s+mean\s+absolute\s+percentage"),
-    ("mape", r"\bmape\b|mean[\s-]*absolute[\s-]*percentage[\s-]*error|средн\w*\s+абсолютн\w*\s+процентн\w*"),
-    ("wape", r"\bw-?mape\b|\bwape\b"),
-    ("medae", r"\bmedae\b|median[\s-]*absolute[\s-]*error"),
-    ("mae", r"\bmae\b|mean[\s-]*absolute[\s-]*error|средн\w*\s+абсолютн\w*\s+ошибк\w*"),
-    ("r2", r"\br\s?(\^\s?2|²|2)(\s?score)?\b|r-squared|коэффициент\w*\s+детерминации"),
+    ("rmsle", rf"{_B}rmsle{_E}|root[\s_-]*mean[\s_-]*squared[\s_-]*log(arithmic)?[\s_-]*error"
+              rf"|sqrt\(\s*mean_squared_log_error|mean_squared_log_error{_ARGS}\)\s*\*\*\s*0?\.5"),
+    ("msle", rf"{_B}msle{_E}|mean[\s_-]*squared[\s_-]*log(arithmic)?[\s_-]*error"),
+    ("rmse", rf"{_B}rmse{_E}|root[\s_-]*mean[\s_-]*squared[\s_-]*error|корень\s+из\s+средн\w*\s+квадрат\w*"
+             rf"|среднеквадратич\w*\s+(ошибк|отклонени)\w*|mean_squared_error{_ARGS}squared\s*=\s*False"
+             rf"|sqrt\(\s*mean_squared_error"),
+    ("mse", rf"{_B}mse{_E}|mean[\s_-]*squared[\s_-]*error|средн\w*\s+квадрат\w*\s+ошибк\w*"),
+    ("smape", rf"{_B}smape{_E}|symmetric[\s_-]+mean[\s_-]+absolute[\s_-]+percentage"),
+    ("mape", rf"{_B}mape{_E}|mean[\s_-]*absolute[\s_-]*percentage[\s_-]*error|средн\w*\s+абсолютн\w*\s+процентн\w*"),
+    ("wape", rf"{_B}w-?mape{_E}|{_B}wape{_E}"),
+    ("medae", rf"{_B}medae{_E}|median[\s_-]*absolute[\s_-]*error"),
+    ("mae", rf"{_B}mae{_E}|mean[\s_-]*absolute[\s_-]*error|средн\w*\s+абсолютн\w*\s+ошибк\w*"),
+    ("r2", rf"{_B}r\s?(\^\s?2|²|2)([\s_]?score)?{_E}|r-squared|коэффициент\w*\s+детерминации"),
     ("macro_f1", r"macro[\s_-]*(averaged[\s_-]*)?f[\s_-]?1|f[\s_-]?1[\s_-]*(score[\s_-]*)?\(?macro|макро[\s_-]*f[\s_-]?1"
-                 r"|f[\s_-]?1[\s_-]*макро"),
-    ("weighted_f1", r"weighted[\s_-]*f[\s_-]?1|f[\s_-]?1[\s_-]*(score[\s_-]*)?\(?weighted|взвешенн\w*\s+f[\s_-]?1"),
-    ("micro_f1", r"micro[\s_-]*f[\s_-]?1|f[\s_-]?1[\s_-]*(score[\s_-]*)?\(?micro|микро[\s_-]*f[\s_-]?1"),
-    ("f1", r"\bf[\s_-]?1([\s_-]*score)?\b|\bf[\s_-]*(мера|measure)\b"),
+                 rf"|f[\s_-]?1[\s_-]*макро|f1_score{_ARGS}average\s*=\s*['\"]macro"),
+    ("weighted_f1", r"weighted[\s_-]*f[\s_-]?1|f[\s_-]?1[\s_-]*(score[\s_-]*)?\(?weighted|взвешенн\w*\s+f[\s_-]?1"
+                    rf"|f1_score{_ARGS}average\s*=\s*['\"]weighted"),
+    ("micro_f1", r"micro[\s_-]*f[\s_-]?1|f[\s_-]?1[\s_-]*(score[\s_-]*)?\(?micro|микро[\s_-]*f[\s_-]?1"
+                 rf"|f1_score{_ARGS}average\s*=\s*['\"]micro"),
+    ("f1", rf"{_B}f[\s_-]?1([\s_-]*score)?{_E}|{_B}f[\s_-]*(мера|measure){_E}"),
     ("balanced_accuracy", r"balanced[\s_-]*accuracy|сбалансированн\w*\s+(точност|accuracy)\w*"),
-    ("accuracy", r"\baccuracy\b|доля\s+(правильн|верн)\w*\s+ответ\w*"),
-    ("qwk", r"\bqwk\b|quadratic(ally)?[\s-]*weighted[\s-]*kappa"),
-    ("kappa", r"cohen'?s?[\s-]*kappa|\bkappa\b"),
-    ("mcc", r"\bmcc\b|matthews"),
-    ("gini", r"\bgini\b|джини"),
-    ("pr_auc", r"\bpr[\s_-]*auc\b|average[\s_-]*precision|auc[\s_-]*pr\b"),
-    ("roc_auc", r"roc[\s_-]*auc|auc[\s_-]*roc|\bauc\b|area\s+under\s+(the\s+)?(roc\s+)?curve"),
-    ("logloss", r"log[\s_-]*loss|cross[\s-]*entropy|кросс[\s-]*энтропи\w*|логарифмическ\w*\s+потер\w*"),
-    ("brier", r"\bbrier\b"),
-    ("precision", r"\bprecision\b"),
-    ("recall", r"\brecall\b|\bполнот\w*"),
+    ("accuracy", rf"{_B}accuracy{_E}|доля\s+(правильн|верн)\w*\s+ответ\w*"),
+    ("qwk", rf"{_B}qwk{_E}|quadratic(ally)?[\s_-]*weighted[\s_-]*kappa|cohen_kappa_score{_ARGS}quadratic"),
+    ("kappa", rf"cohen'?s?[\s_-]*kappa|{_B}kappa{_E}"),
+    ("mcc", rf"{_B}mcc{_E}|matthews"),
+    ("gini", rf"{_B}gini{_E}|джини"),
+    ("pr_auc", rf"{_B}pr[\s_-]*auc{_E}|average[\s_-]*precision|auc[\s_-]*pr{_E}"),
+    ("roc_auc", rf"roc[\s_-]*auc|auc[\s_-]*roc|{_B}auc{_E}|area\s+under\s+(the\s+)?(roc\s+)?curve"
+                r"|площад\w*\s+под\s+(\w+[\s-]+)?(roc|кривой)|roc[\s-]*крив\w*"),
+    ("logloss", r"log[\s_-]*loss|cross[\s_-]*entropy|кросс[\s-]*энтропи\w*|логарифмическ\w*\s+потер\w*"),
+    ("brier", rf"{_B}brier{_E}"),
+    ("precision", rf"{_B}precision{_E}"),
+    ("recall", rf"{_B}recall{_E}|{_B}полнот\w*"),
 ]
 _PRIMARY = re.compile(r"основн\w*|главн\w*|целев\w*\s+метрик\w*|primary|main\s+metric|evaluat\w*|оценива\w*|метрик\w*|metric",
                       re.I)
