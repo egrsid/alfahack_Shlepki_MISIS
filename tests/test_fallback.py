@@ -180,7 +180,7 @@ def test_n_threads_is_positive():
     assert F.model_threads("xgboost", 87_670, 8) == 4 and F.model_threads("lightgbm", 53_308, 8) == 4
 
 
-@pytest.mark.parametrize("budget_left, expected", [(5000.0, 2700.0), (1000.0, 980.0), (100.0, 80.0), (5.0, 20.0)])
+@pytest.mark.parametrize("budget_left, expected", [(3000.0, 1500.0), (1000.0, 980.0), (100.0, 80.0), (5.0, 20.0)])
 def test_budget_from_deadline(budget_left, expected):
     class Deadline:
         def left(self):
