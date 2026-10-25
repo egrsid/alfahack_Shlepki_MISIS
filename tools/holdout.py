@@ -118,7 +118,7 @@ def measure(name: str, zoo_seconds: float, n_random: int, bag: bool) -> pd.DataF
         recent = solution.on_folds(view, folds)
         writes = cand is not best and solution.pick(spec, best, [cand], best, "holdout") is not None
         weights = (cand.meta or {}).get("blend")
-        extra = (cand.meta or {}).get("new_levels")
+        extra = {k: v for k, v in ((cand.meta or {}).get("new_levels") or {}).items() if k != "test_index"}
         table.append({"candidate": label, "cv": round(fallback.effective_cv(view), 5),
                       "cv_recent": round(fallback.effective_cv(recent), 5), "pick": "write" if writes else "",
                       "holdout": round(hold, 5), "holdout_seen": round(hold_seen, 5),

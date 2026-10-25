@@ -102,10 +102,13 @@ def test_period_blend_is_written_unless_clearly_worse_than_fallback(tmp_path):
                                   {**best.meta, "honest": None, "blend": {"a": 0.5, "b": 0.5}, "honest_oof": True,
                                    "fold_scores": eff, "fold_scores_eff": eff, "cv_score_post": float(np.mean(eff))})
 
-    noisy = blend_like({folds[0]: 1.03, folds[1]: 0.99})   # чуть хуже в среднем, но в пределах шума
+    noisy = blend_like({folds[0]: 1.03, folds[1]: 0.99})   # чуть хуже в среднем
     assert solution.pick(spec, best, [noisy], best, "test") is noisy
-    worse = blend_like({i: 1.3 for i in folds})             # явно хуже на поздних фолдах
+    steady = blend_like({i: 1.06 for i in folds})            # стабильно хуже на 6% — в допуске (как на копии public)
+    assert solution.pick(spec, best, [steady], best, "test") is steady
+    worse = blend_like({i: 1.3 for i in folds})             # хуже на 30% — сломанный бленд
     assert solution.pick(spec, best, [worse], best, "test") is None
+    assert solution.within_tolerance("roc_auc", 0.785, 0.80, 0.1) and not solution.within_tolerance("roc_auc", 0.77, 0.80, 0.1)
     single = blend_like({folds[0]: 1.03, folds[1]: 0.99})
     single.meta.pop("blend")                                 # не бленд — только строгое правило
     assert solution.pick(spec, best, [single], best, "test") is None
@@ -127,3 +130,23 @@ def test_new_level_rows_patch_any_written_candidate(tmp_path):
     assert patched.name.endswith("+new_levels") and "test_index" not in patched.meta["new_levels"]
     assert solution.with_new_levels(patched, mixed) is None and solution.with_new_levels(mixed, mixed) is None
     assert solution.with_new_levels(best, None) is None
+
+
+def test_blend_within_tolerance_is_written_for_random_cv(tmp_path):
+    import solution
+    from mocks import make_regression_task
+
+    spec = make_regression_task(tmp_path / "reg", n_train=400)
+    best = fallback.run(spec, None, TWO)
+    assert ensemble.recent_folds(best.meta, len(best.oof)) is None
+    scores = list(fallback.honest_view(best).meta["fold_scores_eff"])
+
+    def blend_like(factor):
+        eff = [s * factor for s in scores]
+        return fallback.Candidate("ensemble", float(np.mean(eff)), 0.0, best.oof, best.test_pred,
+                                  {**best.meta, "honest": None, "blend": {"a": 0.5, "b": 0.5}, "honest_oof": True,
+                                   "fold_scores": eff, "fold_scores_eff": eff, "cv_score_post": float(np.mean(eff))})
+
+    close = blend_like(1.04)
+    assert solution.pick(spec, best, [close], best, "test") is close      # в допуске 5% — бленд
+    assert solution.pick(spec, best, [blend_like(1.08)], best, "test") is None

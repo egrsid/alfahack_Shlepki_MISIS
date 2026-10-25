@@ -49,11 +49,18 @@ AGENT_WINDOW = 3300.0             # окно агента до RESEARCH_END (з�
 AGENT_FINISH = 1200.0             # доводка агента до сидов — не позже RESEARCH_END + это (T+2:25)
 FINAL_RESERVE = 1200.0            # последние 20 минут: финальный бленд, запись и проверка файла (зоопарк B — до них)
 FINAL_SECONDS = float(TOTAL_SECONDS)  # потолок одного этапа зоопарка, SOLUTION_FINAL_SECONDS (0 — зоопарк выкл.)
-# test — новый период: финальный бленд (веса по поздним периодам, новые уровни) пишется, если он не хуже fallback
-# больше шума, а не только «лучше больше шума». Копия public-регрессии «годы 1–4 → год 5»: бленд на годе 5 лучше
-# (29.91 против 30.30, по всем строкам 42.7 против 49.7), а честное CV по поздним фолдам — хуже (37.68 против 36.84):
-# при 4–5 периодах веса фолда подбираются по 1–2 годам, и CV тут шумнее, чем выигрыш. Осознанный риск.
-PERIOD_BLEND_NONINFERIOR = True
+# test — новый период: финальный бленд (зоопарк, веса по поздним периодам, новые уровни) пишется, если по фолдам
+# поздних периодов он хуже fallback не больше чем на PERIOD_BLEND_TOLERANCE (для метрик «больше — лучше» — доля от
+# 1 − score), а не только «лучше больше шума». Копия public-регрессии «годы 1–4 → год 5»: бленд на годе 5 лучше
+# (29.81 против 30.30, по всем строкам 41.6 против 49.7), а честное CV по поздним фолдам — хуже (38.95 против 36.84,
+# +5.7%): при 4–5 периодах веса фолда подбираются по 1–2 годам, а для test — по всем поздним, и CV систематически
+# занижает такой бленд. Осознанный риск (25.10: «время рисковать»); допуск — защита от сломанного бленда.
+# Остальные схемы CV — допуск BLEND_TOLERANCE: лучший кандидат fallback выбран как максимум из многих по тем же OOF, и
+# его CV завышено («проклятие победителя»), а у бленда оценка честная. Копия public-мультикласса (25% групп дублей):
+# fallback CV 0.6428 → на отложенной части 0.6398, бленды CV 0.635–0.640 → 0.643–0.650.
+BLEND_PREFERRED = True
+PERIOD_BLEND_TOLERANCE = 0.10
+BLEND_TOLERANCE = 0.05
 
 
 class Deadline:
@@ -175,6 +182,14 @@ def on_folds(cand: Any, folds: list[int] | None) -> Any:
     return view
 
 
+def within_tolerance(metric: str, value: float, base: float, tolerance: float) -> bool:
+    """value не хуже base больше чем на tolerance: доля |base| для метрик «меньше — лучше», доля 1 − base для «больше —
+    лучше» (AUC, F1, R²: 0.80 → не ниже 0.78 при 0.1)."""
+    if metrics.greater_is_better(metric):
+        return value >= base - tolerance * max(0.0, 1.0 - base)
+    return value <= base + tolerance * abs(base)
+
+
 def pick(spec: Any, current: Any, options: list, trusted: Any, stage: str) -> Any | None:
     """Лучший по CV из options, если он честно лучше записанного current (парные фолды, выигрыш больше шума)
     и прошёл guards против trusted (кандидат fallback); иначе None — файл не трогаем.
@@ -196,15 +211,17 @@ def pick(spec: Any, current: Any, options: list, trusted: Any, stage: str) -> An
     sign = 1.0 if metrics.greater_is_better(spec.metric) else -1.0
     views = sorted(((c, on_folds(fallback.honest_view(c), folds)) for c in options),
                    key=lambda cv: -sign * fallback.effective_cv(cv[1]))
-    if folds and PERIOD_BLEND_NONINFERIOR:
+    if BLEND_PREFERRED:
         base = on_folds(fallback.honest_view(trusted), folds)
+        tolerance = PERIOD_BLEND_TOLERANCE if folds else BLEND_TOLERANCE
         for cand, view in views:
             meta = getattr(cand, "meta", None) or {}
-            if (meta.get("blend") and meta.get("honest_oof") and not fallback.clearly_better(spec.metric, base, view)
+            if (meta.get("blend") and meta.get("honest_oof")
+                    and within_tolerance(spec.metric, fallback.effective_cv(view), fallback.effective_cv(base), tolerance)
                     and not suspicious(spec, cand, trusted)):
-                log.info("%s: бленд %s cv=%.6g не хуже fallback (%.6g) больше шума на фолдах поздних периодов %s — "
-                         "пишется (test — новый период)", stage, cand.name, fallback.effective_cv(view),
-                         fallback.effective_cv(base), folds)
+                log.info("%s: бленд %s cv=%.6g в допуске %.0f%% от fallback (%.6g%s) — пишется", stage, cand.name,
+                         fallback.effective_cv(view), 100 * tolerance, fallback.effective_cv(base),
+                         f", фолды поздних периодов {folds}" if folds else "")
                 return cand
     good = [(c, v) for c, v in views
             if fallback.clearly_better(spec.metric, v, ref) and not suspicious(spec, c, trusted)]
@@ -317,7 +334,9 @@ def run_zoo_a(spec: Any, best: Any, current: Any, deadline: Deadline, with_agent
     start = time.monotonic()
     zoo = final.train(spec, best, until=start + seconds, threads=fallback.n_threads())
     report: dict = {}
-    current = improve(spec, best, current, zoo, "зоопарк A", report=report)
+    # модели зоопарка — только члены бленда: из 14+ моделей одна по CV всегда «явно лучше» случайно (синтетика
+    # reg_mae_en, 442 строки: записан lgbm_et с CV 46.05 против 46.34 — на test 44.9 против 43.7)
+    current = improve(spec, best, current, [], "зоопарк A", members=zoo, report=report)
     log.info("зоопарк A: %d моделей за %.0f с (окно %.0f с)", len(zoo), time.monotonic() - start, seconds)
     return current, zoo, blend_weights(report)
 
@@ -343,7 +362,7 @@ def run_zoo_b(spec: Any, best: Any, current: Any, deadline: Deadline, zoo: list,
                        tag="b", seed_offset=1)
     zoo = [*zoo, *more]
     if bagged or more:
-        current = improve(spec, best, current, [*extra, *zoo], "зоопарк B", members=members)
+        current = improve(spec, best, current, list(extra), "зоопарк B", members=[*members, *zoo])
     log.info("зоопарк B: сиды у %d, новых моделей %d за %.0f с (окно %.0f с)", len(bagged), len(more),
              time.monotonic() - start, seconds)
     return current, zoo
@@ -428,7 +447,7 @@ def solve(task_path: str | Path, *, llm: Any = "auto", deadline: Deadline | None
             accepted = [c for c in agent_cands if not (getattr(c, "meta", None) or {}).get("pool_only")]
             log.info("агент: принято %d, в пуле бленда %d", len(accepted), len(pool))
             report: dict = {}
-            current = improve(spec, best, current, [*found, *zoo, *accepted], "агент", members=pool, report=report)
+            current = improve(spec, best, current, [*found, *accepted], "агент", members=[*pool, *zoo], report=report)
             weights = blend_weights(report) or weights
         except Exception:
             log.exception("агент упал — остаётся записанный сабмит")
