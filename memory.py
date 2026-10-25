@@ -86,6 +86,12 @@ _SYNONYMS = {
 
 
 _OPPOSITES = (("increase", "decrease"),)
+# виды, которые добавляют колонки: «частотное кодирование city» (encoding) и «частота city» (features) — одна идея
+_KIND_FAMILY = {"features": "columns", "encoding": "columns", "missing": "columns"}
+
+
+def same_family(kind_a: str, kind_b: str) -> bool:
+    return _KIND_FAMILY.get(kind_a, kind_a) == _KIND_FAMILY.get(kind_b, kind_b)
 
 
 def _canonical(word: str) -> str:
@@ -127,9 +133,9 @@ def similar_titles(a: str, b: str) -> float:
 
 def same_idea(title_a: str, kind_a: str, title_b: str, kind_b: str, columns: Iterable[str] = (),
               threshold: float = 0.6) -> bool:
-    """Одна и та же гипотеза другими словами: тот же kind и (при названных колонках — те же колонки)
-    похожие действия над ними."""
-    if kind_a != kind_b:
+    """Одна и та же гипотеза другими словами: тот же kind (features/encoding/missing — одно семейство: все
+    добавляют колонки) и (при названных колонках — те же колонки) похожие действия над ними."""
+    if not same_family(kind_a, kind_b):
         return False
     if normalize_title(title_a) == normalize_title(title_b):
         return True

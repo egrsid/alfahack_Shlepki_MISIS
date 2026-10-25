@@ -160,8 +160,10 @@ def test_same_idea_table(kind, a, b, expected):
     assert same_idea(b, kind, a, kind, COLUMNS) is expected  # симметрично
 
 
-def test_same_idea_needs_same_kind():
-    assert not same_idea("Frequency encoding of city", "encoding", "Frequency of city", "features", COLUMNS)
+def test_same_idea_needs_same_kind_family():
+    # features/encoding/missing — все добавляют колонки: одна идея (живой прогон: «тип × класс» прошёл дважды)
+    assert same_idea("Frequency encoding of city", "encoding", "Frequency of city", "features", COLUMNS)
+    assert not same_idea("Frequency encoding of city", "encoding", "Frequency of city", "params", COLUMNS)
 
 
 def test_mentioned_columns_whole_words_and_spaces():
@@ -174,7 +176,8 @@ def test_find_similar_rejected_blocks_failed_allows_one_retry():
     exp(memory, "Frequency encoding of facility_type", "rejected", kind="encoding")
     exp(memory, "Ratio sbytes / dbytes", "failed", error="KeyError")
     assert memory.find_similar("Count encoding facility_type", "encoding").id == 1
-    assert memory.find_similar("Count encoding facility_type", "features") is None
+    assert memory.find_similar("Count encoding facility_type", "features").id == 1  # то же семейство видов
+    assert memory.find_similar("Count encoding facility_type", "params") is None
     assert memory.find_similar("sbytes divided by dbytes", "features") is None  # одно падение — можно повторить
     exp(memory, "sbytes / dbytes ratio", "failed", error="KeyError")
     assert memory.find_similar("sbytes divided by dbytes", "features").id == 3

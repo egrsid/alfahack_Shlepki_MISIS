@@ -78,6 +78,10 @@ class AgentConfig:
     max_iters: int = 100
     hypotheses_per_plan: int = 6
     max_empty_plans: int = 2            # подряд планов без новых гипотез → стоп
+    # режим рецепта: живой прогон на public-регрессии остановился так за 35 мин до конца окна — там пустой план
+    # повторяется с просьбой о других направлениях и большей температурой (и не совпадает с кэшем клиента LLM)
+    recipe_max_empty_plans: int = 6
+    retry_plan_temperature: float = 1.0
     max_consecutive_failures: int = 6
     max_no_improve: int = 30            # плато
     max_tokens: int = 600_000           # доля агента в токенах на задачу (вход + выход)
@@ -1438,7 +1442,8 @@ class _Research:
                 self._plan()
                 if not self.queue:
                     self.empty_plans += 1
-                    if self.empty_plans >= self.cfg.max_empty_plans and not self._queue_auto_strategy():
+                    limit = self.cfg.recipe_max_empty_plans if self.recipe else self.cfg.max_empty_plans
+                    if self.empty_plans >= limit and not self._queue_auto_strategy():
                         self.stop_reason = "planner gives no new hypotheses"
                         break
                     continue
@@ -1813,10 +1818,12 @@ class _Research:
             task_line=self.task_line, task_text=self.task_text, profile=self.profile_text, base_code=self.base_code,
             cv_text=self._cv_text(), n=cfg.hypotheses_per_plan, errors=self.errors_text,
             can_tune=self.tuner is not None, can_search_models=cfg.model_search, recipe=self.recipe,
-            signals=self.signals,
+            signals=self.signals, retry=self.empty_plans if self.recipe else 0,
             memory=self.memory.planner_brief(cfg.memory_chars, kinds=self._kinds(), task_type=self.task_type),
             task_chars=cfg.task_text_chars, profile_chars=cfg.profile_chars, memory_chars=cfg.memory_chars)
-        kw = dict(max_tokens=cfg.plan_max_tokens, temperature=cfg.plan_temperature)
+        retry = self.recipe and self.empty_plans > 0
+        kw = dict(max_tokens=cfg.plan_max_tokens,
+                  temperature=cfg.retry_plan_temperature if retry else cfg.plan_temperature)
         data: Any = None
         try:
             if callable(getattr(self.llm, "chat_json", None)):

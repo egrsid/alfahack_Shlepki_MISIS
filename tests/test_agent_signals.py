@@ -72,5 +72,5 @@ def test_plan_prompt_with_signals_fits_budget():
     profile = "\n".join(f"col{i} | num | 1.0 | 1000 | 0..100 | заметка о колонке номер {i}" for i in range(80))
     messages = P.build_plan_messages(task_line="type: regression", task_text="Задача. " * 400, profile=profile,
                                      base_code="x" * 3000, cv_text="CV rmse = 41", memory="m" * 1500, n=6,
-                                     recipe=True, signals="- " + "s" * 2000, errors="e" * 800)
+                                     recipe=True, signals="- " + "s" * 2000, errors="e" * 800, retry=5)
     assert "## Baseline facts" in messages[1]["content"] and P.messages_tokens(messages) <= 4000

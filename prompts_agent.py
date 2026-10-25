@@ -254,7 +254,7 @@ def build_plan_messages(*, task_line: str, task_text: str, profile: str, base_co
                         code_chars: int = 2000, memory_chars: int = 1500, errors: str = "",
                         errors_chars: int = 800, can_tune: bool = False,
                         can_search_models: bool = False, recipe: bool = False, signals: str = "",
-                        signals_chars: int = 1600) -> list[dict]:
+                        signals_chars: int = 1600, retry: int = 0) -> list[dict]:
     if signals:  # сигналы рецепта дороже длинного профиля: профиль ужимается, чтобы вызов остался в бюджете
         profile_chars = min(profile_chars, 3400)
     user = (f"## Task\n{task_line}\n{clip(task_text, task_chars)}\n\n"
@@ -264,7 +264,11 @@ def build_plan_messages(*, task_line: str, task_text: str, profile: str, base_co
             + f"## Current best solution ({cv_text})\n```python\n{clip(base_code, code_chars)}\n```\n\n"
             + (f"## Where the current model errs\n{clip(errors, errors_chars)}\n\n" if errors else "")
             + f"## Memory\n{clip(memory, memory_chars)}\n\n"
-            f"Propose up to {n} new hypotheses as ONE JSON object.")
+            + (f"Attempt {retry + 1}: your previous plan only repeated ideas from Memory. Propose clearly "
+               "DIFFERENT directions: columns no experiment has used yet, other operations (group statistics, "
+               "differences of related columns, counts, ranks within a group), other combinations of strong "
+               "columns.\n" if retry else "")
+            + f"Propose up to {n} new hypotheses as ONE JSON object.")
     system = PLANNER_SYSTEM.format(n=n)
     if recipe:
         system = _recipe_planner(system)

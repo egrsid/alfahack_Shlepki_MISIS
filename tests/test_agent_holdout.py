@@ -8,7 +8,7 @@ import pytest
 import agent
 import agent_eval
 import fallback
-from mocks import GOOD_CODE, MockLLM, SimpleDeadline, fenced, make_regression_task, plan
+from mocks import GOOD_CODE, MockLLM, SimpleDeadline, feature_code, fenced, make_regression_task, plan
 from test_agent_loop import FAST, experiments
 
 
@@ -104,3 +104,20 @@ def test_iteration_does_not_eat_time_reserved_for_bagging():
     assert loop._stop_reason() == ""
     loop.reference_seconds = 150.0  # доводка ~375 с + итерация ~188 с > 400 с
     assert loop._stop_reason().startswith("time:") and "bagging of the best" in loop._stop_reason()
+
+
+def test_empty_plans_are_retried_with_a_nudge_instead_of_stopping(tmp_path):
+    spec = make_regression_task(tmp_path / "reg", n_train=500)
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm",), try_log_target=False, bag_seeds=1))
+    same = plan("Interaction x1*x2")
+    ratio = feature_code('df["x1_div_x3"] = df["x1"] / df["x3"].replace(0, np.nan)')
+    llm = MockLLM({"planner": [same, same, same, plan("Ratio x1 / x3")], "coder": [fenced(GOOD_CODE), fenced(ratio)],
+                   "critic": ["Try ratios."] * 3})
+    agent.research(spec, best, llm, SimpleDeadline(1200), evaluate=agent_eval.RecipeEvaluator(best, threads=2),
+                   config=agent.AgentConfig(**{**FAST, "max_iters": 2, "screen": False}))
+    planner = [(m, kw) for role, m, kw in llm.calls if role == "planner"]
+    assert len(planner) == 4  # раньше — стоп после двух пустых планов подряд
+    assert "Attempt" not in planner[1][0][1]["content"] and planner[1][1]["temperature"] == 0.7
+    assert "Attempt 3: your previous plan only repeated" in planner[3][0][1]["content"]
+    assert planner[3][1]["temperature"] == 1.0
+    assert [r["hypothesis"] for r in experiments(spec)] == ["Interaction x1*x2", "Ratio x1 / x3"]
