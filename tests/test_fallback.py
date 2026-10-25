@@ -1,3 +1,5 @@
+import types
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -401,3 +403,36 @@ def test_seed_bagging_skipped_without_time(tmp_path):
             return 30.0
     cand = F.run(spec, Deadline(), config=_cfg(bag_seeds=3))
     assert "bagged_seeds" not in cand.meta and submission.check_file(spec) == []
+
+
+def test_fold_weights_are_fitted_without_their_fold():
+    # 3 фолда: A точна только на фолде 0, B — только на остальных. Веса на всех OOF берут обе модели (оценка
+    # оптимистична), а веса фолда 0 подбираются на фолдах 1–2 — там A бесполезна, и фолд 0 честно получает ошибку B
+    folds = np.repeat([0, 1, 2], 10)
+    a, b = np.where(folds == 0, 0.0, 5.0), np.where(folds == 0, 5.0, 0.0)
+    data = types.SimpleNamespace(y=np.zeros(30), folds=folds, n_splits=3, metric="rmse")
+    runs = [F.Run(name, "lightgbm", oof, np.zeros(4), [], 0.0, {}, None, []) for name, oof in (("A", a), ("B", b))]
+    in_sample = F.blend(data, runs)
+    assert in_sample is not None and set(in_sample[2]) == {"A", "B"}
+    per_fold = F.fold_weights(data, runs)
+    assert len(per_fold) == 3 and per_fold[0] == {"B": 1.0}
+    honest = F.mix_by_folds(data, per_fold, {"A": a, "B": b})
+    assert np.allclose(honest[folds == 0], 5.0)
+    assert metrics.score("rmse", data.y, honest) > metrics.score("rmse", data.y, in_sample[0])
+
+
+def test_honest_view_swaps_scores_and_oof_but_keeps_what_is_written():
+    folds = np.repeat([0, 1], 5)
+    data = types.SimpleNamespace(task="regression", metric="rmse", y=np.zeros(10), folds=folds, n_splits=2,
+                                 cv_scheme={}, rows=None, classes=None, shift_weights=None, label_shift=None)
+    oof, honest, test = np.full(10, 1.0), np.full(10, 2.0), np.arange(3.0)
+    cand = F.make_candidate(data, "fallback_blend", oof, test, F._fold_scores(data, oof), {"members": {"a": 1.0}},
+                            F.FallbackConfig(), 0, honest_oof=honest)
+    assert cand.meta["cv_score_post"] == pytest.approx(1.0)
+    assert cand.meta["honest"]["cv_score_post"] == pytest.approx(2.0)
+    view = F.honest_view(cand)
+    assert view.oof is honest and view.test_pred is test and view.name == cand.name
+    assert view.meta["fold_scores_eff"] == [2.0, 2.0] and F.effective_cv(view) == pytest.approx(2.0)
+    assert "honest" not in view.meta and F.honest_view(view) is view  # уже честный — без изменений
+    single = F.make_candidate(data, "fallback_lightgbm", oof, test, [1.0, 1.0], {}, F.FallbackConfig(), 0)
+    assert "honest" not in single.meta and F.honest_view(single) is single

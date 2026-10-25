@@ -8,6 +8,7 @@ import agent_eval
 import fallback
 import prompts_agent as P
 from mocks import GOOD_CODE, MockLLM, SimpleDeadline, fenced, identity_features, make_regression_task, plan
+from p3_fixtures import regression_task
 from test_agent_loop import FAST, experiments
 
 # fallback из одного LightGBM без лог-таргета: признак x1*x2 он сам не построит — новая колонка честно помогает
@@ -89,3 +90,67 @@ def test_bagged_and_randomforest_members_are_resolved(tmp_path):
     cand = agent_eval.RecipeEvaluator(forest, threads=2)(spec, with_columns(
         ratio=lambda f: f["x1"] / f["x3"], city2=lambda f: f["city"] + "_"))  # NaN и категория → числа для sklearn
     assert np.isfinite(cand.cv_score)
+
+
+@pytest.fixture
+def blended(tmp_path, monkeypatch):
+    """Лучший fallback — бленд LightGBM + XGBoost, усреднённый по 3 сидам (принятие бленда форсировано)."""
+    spec, _ = regression_task(tmp_path / "reg", n_train=500, n_test=150)
+    monkeypatch.setattr(fallback, "clearly_better",
+                        lambda metric, new, old, k=1.0: new.name == "fallback_blend" and "_bag" not in old.name)
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm", "xgboost"), try_log_target=False))
+    monkeypatch.undo()
+    assert best.name == "fallback_blend_bag3" and best.meta.get("honest")
+    return spec, best
+
+
+def test_blend_reference_is_honest_and_bag_reproduces_fallback(blended):
+    spec, best = blended
+    ctx = best.meta["context"]
+    assert ctx.fold_members and len(ctx.fold_members) == ctx.data.n_splits
+    evaluate = agent_eval.RecipeEvaluator(best, threads=2)
+    assert evaluate.bag_seeds == 3 and evaluate.fold_members == ctx.fold_members
+    reference = evaluate(spec, identity_features)
+    honest = fallback.mix_by_folds(ctx.data, ctx.fold_members, {r.name: r.oof for r in ctx.runs})
+    assert reference.oof == pytest.approx(honest, rel=1e-6)  # oof — честная смесь, а не смесь весами на всех OOF
+    assert reference.cv_score == pytest.approx(np.mean(fallback._fold_scores(ctx.data, honest)), rel=1e-6)
+    bagged = evaluate.bag(spec, identity_features, reference)
+    assert bagged.meta["bagged_seeds"] == 3 and bagged.test_pred.shape == best.test_pred.shape
+    # те же сиды, что у bag3 fallback: без новых колонок — ровно записанный fallback, оценённый честно
+    assert bagged.cv_score == pytest.approx(fallback.effective_cv(fallback.honest_view(best)), rel=1e-3)
+    assert bagged.test_pred == pytest.approx(best.test_pred, rel=1e-3)
+
+
+@pytest.fixture
+def bagged_task(tmp_path):
+    spec = make_regression_task(tmp_path / "reg", n_train=500)
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm",), try_log_target=False))
+    assert best.meta.get("bagged_seeds") == 3
+    return spec, best
+
+
+def _research(spec, best, **cfg):
+    llm = MockLLM({"planner": [plan("Interaction x1*x2")], "coder": [fenced(GOOD_CODE)]})
+    return agent.research(spec, best, llm, SimpleDeadline(1200), config=agent.AgentConfig(**{**FAST, **cfg}),
+                          evaluate=agent_eval.RecipeEvaluator(best, threads=2))
+
+
+def test_agent_bags_its_best_like_fallback(bagged_task, caplog):
+    spec, best = bagged_task
+    with caplog.at_level("INFO"):
+        result = _research(spec, best, max_iters=1)
+    names = [c.name for c in result]
+    assert any(n.endswith("_bag3") for n in names) and any(not n.endswith("_bag3") for n in names)
+    bagged = next(c for c in result if c.name.endswith("_bag3"))
+    assert bagged.meta["bagged_seeds"] == 3 and bagged.meta["new_columns"] == ["x1_x2"] and bagged.meta["code"]
+    assert fallback.clearly_better(spec.metric, bagged, best)  # с теми же сидами лучше записанного bag3
+    assert "research: agent_01_features_bag3" in caplog.text
+
+
+def test_agent_bagging_can_be_off_or_skipped_without_time(bagged_task, caplog):
+    spec, best = bagged_task
+    assert not any(c.name.endswith("_bag3") for c in _research(spec, best, max_iters=1, bag_best=False))
+    with caplog.at_level("INFO"):
+        result = _research(spec, best, max_iters=1, final_reserve_seconds=10_000)
+    assert result and not any(c.name.endswith("_bag3") for c in result)
+    assert "bagging of agent_01_features skipped" in caplog.text

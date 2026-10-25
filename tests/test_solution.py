@@ -9,6 +9,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -158,3 +159,28 @@ def test_environment_is_logged(caplog):
     with caplog.at_level(logging.INFO):
         found = solution.log_environment()
     assert found["lightgbm"] and "окружение: Python" in caplog.text and set(found) == set(solution.OPTIONAL_PACKAGES)
+
+
+def test_pick_compares_with_honest_estimate_of_fallback_blend(tmp_path, caplog):
+    # RMSE: веса бленда fallback подобраны на тех же OOF (9.0), честно — 10.0; претендент 9.6 лучше честной оценки
+    spec = make_regression_task(tmp_path / "reg")
+    test = np.random.default_rng(0).normal(size=150)
+
+    def cand(name, scores, **meta):
+        return fallback.Candidate(name, float(np.mean(scores)), float(np.std(scores)), np.zeros(400), test.copy(),
+                                  {"fold_scores": scores, "fold_scores_eff": scores, "cv_score_post": np.mean(scores),
+                                   **meta})
+    honest = {"oof": np.zeros(400), "fold_scores": [10.0, 10.2, 9.9, 10.1, 10.0],
+              "fold_scores_eff": [10.0, 10.2, 9.9, 10.1, 10.0], "cv_score_post": 10.04}
+    blend = cand("fallback_blend", [9.0, 9.1, 8.9, 9.0, 9.0], honest=honest)
+    challenger = cand("agent_01", [9.6, 9.7, 9.5, 9.6, 9.6])
+    with caplog.at_level(logging.INFO):
+        assert solution.pick(spec, blend, [challenger], blend, "агент") is challenger
+    assert "честная оценка" in caplog.text
+    plain = cand("fallback_blend", [9.0, 9.1, 8.9, 9.0, 9.0])  # без честной оценки — претендент хуже
+    assert solution.pick(spec, plain, [challenger], plain, "агент") is None
+
+
+def test_automl_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("SOLUTION_AUTOML_SECONDS", raising=False)
+    assert solution.automl_seconds(deadline(research=10_000), with_agent=True) == 0

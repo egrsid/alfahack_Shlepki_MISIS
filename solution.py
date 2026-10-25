@@ -3,10 +3,13 @@
 0. понимание задачи (task_understanding): эвристики по файлам + проверенные подсказки LLM (метрика, даты, текст).
 1. fallback (P3): spec по файлам задачи, честная схема CV (периоды / группы дублей), бустинги, бленд, веса классов.
    submission.csv пишется сразу (константа), затем после каждой лучшей модели.
-2. AutoML (automl.py): AutoGluon на ТЕХ ЖЕ фолдах, до 40 мин; бленд «все модели fallback + AutoGluon».
+2. AutoML (automl.py): по умолчанию выключен (SOLUTION_AUTOML_SECONDS > 0 — включить): на public AutoGluon
+   проигрывал fallback и на CV, и на отложенной части, а 40 минут нужнее агенту. Включённый — AutoGluon на ТЕХ ЖЕ
+   фолдах; бленд «все модели fallback + AutoGluon».
 3. агент (P4): LLM-цикл гипотез на ТЕХ ЖЕ фолдах; затем бленд «fallback + AutoGluon + агент» (ensemble).
    После шагов 2 и 3 пишется лучший из кандидатов и бленда, только если по парным фолдам он лучше уже записанного
-   больше шума и прошёл guards (сверка test-прогноза с fallback).
+   больше шума и прошёл guards (сверка test-прогноза с fallback). Сравнение — по честным оценкам с обеих сторон:
+   у бленда fallback веса фолда подобраны на остальных фолдах (fallback.honest_view), как у ensemble и агента.
 4. проверка записанного файла; если он испорчен — переписывается кандидатом fallback.
 
 Любой сбой агента или LLM оставляет сабмит fallback. Ключ и адрес LLM — только из переменных окружения
@@ -33,7 +36,7 @@ log = logging.getLogger("solution")
 
 TOTAL_SECONDS = 3 * 3600          # лимит платформы на задачу (включая LLM)
 RESEARCH_END = TOTAL_SECONDS - 1800  # агент не начинает ничего после T+2ч30: запас на запись и проверку
-AUTOML_SECONDS = 2400.0           # AutoGluon сразу после fallback (не зависит от LLM)
+AUTOML_SECONDS = 0.0              # AutoGluon после fallback: выключен (проигрывал fallback), SOLUTION_AUTOML_SECONDS
 AGENT_MIN_SECONDS = 900.0         # AutoML оставляет агенту хотя бы столько окна research
 
 
@@ -146,18 +149,25 @@ def suspicious(spec: Any, cand: Any, best: Any) -> list[str]:
 
 def pick(spec: Any, current: Any, options: list, trusted: Any, stage: str) -> Any | None:
     """Лучший по CV из options, если он честно лучше записанного current (парные фолды, выигрыш больше шума)
-    и прошёл guards против trusted (кандидат fallback); иначе None — файл не трогаем."""
-    good = [c for c in options if fallback.clearly_better(spec.metric, c, current) and not suspicious(spec, c, trusted)]
-    if not good:
-        if options:
-            top = options[0]
-            log.info("%s: лучший кандидат %s cv=%.6g не лучше записанного %s (%.6g) больше шума", stage, top.name,
-                     fallback.effective_cv(top), current.name, fallback.effective_cv(current))
-        return None
+    и прошёл guards против trusted (кандидат fallback); иначе None — файл не трогаем.
+
+    Оценки — честные с обеих сторон (fallback.honest_view): веса бленда fallback подобраны на тех же OOF, по которым
+    он оценивается, и без этого претендент с честной оценкой (ensemble, агент) проигрывал бы ему по построению.
+    """
+    ref = fallback.honest_view(current)
     sign = 1.0 if metrics.greater_is_better(spec.metric) else -1.0
-    winner = max(good, key=lambda c: sign * fallback.effective_cv(c))
-    log.info("%s: %s cv=%.6g лучше записанного %s (%.6g) больше шума", stage, winner.name,
-             fallback.effective_cv(winner), current.name, fallback.effective_cv(current))
+    views = sorted(((c, fallback.honest_view(c)) for c in options), key=lambda cv: -sign * fallback.effective_cv(cv[1]))
+    good = [(c, v) for c, v in views
+            if fallback.clearly_better(spec.metric, v, ref) and not suspicious(spec, c, trusted)]
+    if not good:
+        if views:
+            top = views[0][1]
+            log.info("%s: лучший кандидат %s cv=%.6g не лучше записанного %s (%.6g, честная оценка) больше шума",
+                     stage, top.name, fallback.effective_cv(top), current.name, fallback.effective_cv(ref))
+        return None
+    winner, view = good[0]
+    log.info("%s: %s cv=%.6g лучше записанного %s (%.6g, честная оценка) больше шума", stage, winner.name,
+             fallback.effective_cv(view), current.name, fallback.effective_cv(ref))
     return winner
 
 
@@ -168,7 +178,8 @@ def improve(spec: Any, best: Any, current: Any, extra: list, stage: str) -> Any:
     if extra:
         try:
             import ensemble
-            mixed = ensemble.blend(spec, [best, *fallback.pool(best), *extra])
+            # fallback — с честным OOF: его веса бленда подобраны на тех же строках, а ensemble оценивает честно
+            mixed = ensemble.blend(spec, [fallback.honest_view(best), *fallback.pool(best), *extra])
             if mixed is not None:
                 options.insert(0, mixed)
         except Exception:

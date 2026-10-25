@@ -361,6 +361,12 @@ class RecipeEvaluator:
     (fallback.make_candidate). cv_score и fold_scores — эффективные (как у fallback.clearly_better), поэтому без
     новых колонок кандидат воспроизводит лучший fallback, а агент улучшает именно его. cfg (модель/параметры кода
     LLM) не используется: модели — у рецепта. recipe_mode — признак для агента («только новые колонки»).
+
+    Оценка честная, как у ensemble.blend: если лучший fallback — бленд, фолд f смешивается весами, подобранными
+    fallback на остальных фолдах (ctx.fold_members; модели вне рецепта — их OOF из fallback как есть); oof кандидата —
+    эта честная смесь, test_pred — смесь с весами рецепта. bag_seeds — сколько сидов усреднено в итоге fallback:
+    bag() доводит кандидата до того же числа сидов (те же сиды, что у fallback), чтобы сравнение с записанным
+    fallback не проигрывалось из-за одного сида против трёх.
     """
 
     recipe_mode = True
@@ -374,6 +380,11 @@ class RecipeEvaluator:
         self.members = {name: float(w) for name, w in ctx.members.items() if name in self.runs and w > 0}
         if not self.members:
             raise ValueError("best fallback candidate has no trained members")
+        fold_members = getattr(ctx, "fold_members", None)
+        names = {name for weights in (fold_members or []) for name in weights}
+        self.fold_members = fold_members if fold_members and names <= set(self.runs) else None
+        self.base_oofs = {r.name: r.oof for r in ctx.runs}
+        self.bag_seeds = int((getattr(best, "meta", None) or {}).get("bagged_seeds") or 1)
         self.threads = threads
         self.calls = 0
         self._inputs: tuple[pd.DataFrame, pd.DataFrame, dict] | None = None
@@ -395,12 +406,10 @@ class RecipeEvaluator:
             self._inputs = (train[feats], test[feats].reset_index(drop=True), spec_dict)
         return self._inputs
 
-    def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
+    def _frames(self, spec: Any, build_features: Any) -> tuple[Any, list[str]]:
+        """Копия данных fallback, где к матрицам каждой модели рецепта добавлены новые колонки build_features."""
         import copy as copy_module
 
-        import fallback
-
-        self.calls += 1
         ctx = self.ctx
         train, test, spec_dict = self._raw(spec)
         x_tr, x_te = build_features(train.copy(), test.copy(), spec_dict)
@@ -427,27 +436,81 @@ class RecipeEvaluator:
             data.frames[key] = (pd.concat([x.reset_index(drop=True), add_tr], axis=1),
                                 pd.concat([x_test.reset_index(drop=True), add_te], axis=1),
                                 cats if key == "randomforest" else [*cats, *cat_new])
+        return data, new
 
+    def _fit(self, data: Any, seeds: tuple[int, ...], deadline: Any) -> tuple[np.ndarray, np.ndarray, Any]:
+        """Члены рецепта, каждый усреднён по seeds (0 — сид fallback, k — сид fallback + k, как в его bag3):
+        (OOF с весами рецепта, test_pred, честный OOF по весам фолдов или None)."""
+        import fallback
+
+        ctx = self.ctx
         threads = self.threads or fallback.n_threads()
         oof = test_pred = None
-        for i, (name, weight) in enumerate(self.members.items()):
+        member_oofs: dict[str, np.ndarray] = {}
+        jobs, done = len(self.members) * len(seeds), 0
+        for name, weight in self.members.items():
             run = self.runs[name]
-            left = _left(deadline)
-            if left <= 0:
-                raise TimeoutError(f"evaluation stopped before member {name}")
-            stop_at = time.monotonic() + (left / (len(self.members) - i) if math.isfinite(left) else 1e9)
-            fitted = fallback.cv_model(data, name, run.model, ctx.config, stop_at, transform=run.transform,
-                                       extra=dict(getattr(run, "extra", None) or {}), threads=threads,
-                                       exclude=run.exclude,
-                                       entity=run.entity)
-            oof = weight * fitted.oof if oof is None else oof + weight * fitted.oof
-            test_pred = weight * fitted.test_pred if test_pred is None else test_pred + weight * fitted.test_pred
-        scores = fallback._fold_scores(data, oof)
-        cand = fallback.make_candidate(data, "agent_recipe", oof, test_pred, scores,
+            oofs, tests = [], []
+            for seed in seeds:
+                left = _left(deadline)
+                if left <= 0:
+                    raise TimeoutError(f"evaluation stopped before member {name}")
+                stop_at = time.monotonic() + (left / (jobs - done) if math.isfinite(left) else 1e9)
+                extra = dict(getattr(run, "extra", None) or {})
+                if seed:
+                    extra.update(fallback.seed_params(run.model, ctx.config.seed + seed))
+                fitted = fallback.cv_model(data, name, run.model, ctx.config, stop_at, transform=run.transform,
+                                           extra=extra, threads=threads, exclude=run.exclude, entity=run.entity)
+                oofs.append(fitted.oof)
+                tests.append(fitted.test_pred)
+                done += 1
+            member_oofs[name] = sum(oofs) / len(oofs)
+            member_test = sum(tests) / len(tests)
+            oof = weight * member_oofs[name] if oof is None else oof + weight * member_oofs[name]
+            test_pred = weight * member_test if test_pred is None else test_pred + weight * member_test
+        honest = None
+        if self.fold_members:
+            honest = fallback.mix_by_folds(data, self.fold_members, {**self.base_oofs, **member_oofs})
+        return oof, test_pred, honest
+
+    def _candidate(self, data: Any, new: list[str], oof: np.ndarray, test_pred: np.ndarray, honest: Any,
+                   seeds: int) -> Candidate:
+        import fallback
+
+        ctx = self.ctx
+        cand = fallback.make_candidate(data, "agent_recipe", oof, test_pred, fallback._fold_scores(data, oof),
                                        {"model": "recipe", "members": dict(self.members)}, ctx.config,
-                                       self.decision_seconds)
+                                       self.decision_seconds, honest)
+        cand = fallback.honest_view(cand)  # честная оценка: oof и оценки фолдов — по весам без этого фолда
         eff = [float(s) for s in cand.meta["fold_scores_eff"]]
         cand.meta.update(fold_scores_raw=cand.meta["fold_scores"], fold_scores=eff, fold_ids=data.folds,
-                         new_columns=new, evaluator="recipe")
+                         new_columns=new, evaluator="recipe", seeds=seeds,
+                         recipe_raw={"oof": oof, "test_pred": test_pred, "honest": honest})
+        if seeds > 1:
+            cand.meta["bagged_seeds"] = seeds
         cand.cv_score, cand.cv_std = float(np.mean(eff)), float(np.std(eff))
         return cand
+
+    def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
+        self.calls += 1
+        data, new = self._frames(spec, build_features)
+        oof, test_pred, honest = self._fit(data, (0,), deadline)
+        return self._candidate(data, new, oof, test_pred, honest, 1)
+
+    def bag(self, spec: Any, build_features: Any, base: Any, deadline: Any = None) -> Candidate:
+        """base — кандидат этого evaluator на тех же колонках (сид fallback); дообучаются сиды 1..bag_seeds−1 и
+        усредняются с ним (смесь линейна по OOF членов, поэтому среднее смесей = смесь средних)."""
+        raw = (getattr(base, "meta", None) or {}).get("recipe_raw")
+        if raw is None or self.bag_seeds <= 1:
+            raise ValueError("nothing to bag: no recipe_raw in the base candidate or bag_seeds <= 1")
+        self.calls += 1
+        data, new = self._frames(spec, build_features)
+        extra = tuple(range(1, self.bag_seeds))
+        oof, test_pred, honest = self._fit(data, extra, deadline)
+        n, total = len(extra), len(extra) + 1
+
+        def average(first: Any, rest: Any) -> Any:
+            return None if first is None or rest is None else (first + n * rest) / total
+
+        return self._candidate(data, new, average(raw["oof"], oof), average(raw["test_pred"], test_pred),
+                               average(raw["honest"], honest), total)

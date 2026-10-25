@@ -241,9 +241,10 @@ class Candidate:
   (12 тестовых задач и прогон ZIP на них), `try_agent.py` (короткий прогон агента), `baseline.py`, `check_llm.py`.
 - `tests/` — pytest всех модулей, без LLM (`LLM_DISABLED=1`, MockLLM). `docs/plans/<ветка>.md` — план и итоги каждой ветки,
   `docs/plans/integration-submission.md` — как собрано решение и замеры, `docs/submissions.md` — таблица сабмитов.
-- Конвейер `solution.py`: понимание задачи (`task_understanding`) → `fallback` (P3) → AutoGluon (`automl`, до 40 мин, на
-  тех же фолдах) → агент (`agent`, стартует с лучшего кандидата fallback и добавляет признаки) → бленды (`ensemble`) →
-  запись только при честном выигрыше над уже записанным и после `guards` → проверка файла.
+- Конвейер `solution.py`: понимание задачи (`task_understanding`) → `fallback` (P3) → [AutoGluon (`automl`), по умолчанию
+  выключен] → агент (`agent`, стартует с лучшего кандидата fallback, добавляет признаки, лучшего доводит до 3 сидов) →
+  бленды (`ensemble`) → запись только при честном выигрыше над уже записанным (оценки честные с обеих сторон:
+  `fallback.honest_view`) и после `guards` → проверка файла.
 
 ## Статус
 - 2026-10-25: все ветки объединены в `main` (через `integration/submission`): P2 `llm_client`, P3 fallback/metrics/

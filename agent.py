@@ -131,6 +131,9 @@ class AgentConfig:
     # конец исследования: множители вероятностей классов под метрику по меткам (macro F1, accuracy, ...)
     postprocess: bool = True
     postprocess_folds: int = 5          # части OOF для честной оценки весов
+    # конец исследования поверх рецепта fallback: лучший принятый — с тем же числом сидов, что итог fallback (bag3)
+    bag_best: bool = True
+    final_reserve_seconds: float = 600.0  # доводка идёт после окна research, но оставляет столько до конца 3 часов
     error_chars: int = 1500
     # файлы
     workdir_name: str = ".agent_work"
@@ -1101,6 +1104,32 @@ class _SubDeadline:
         return getattr(self._parent, name)
 
 
+class _FinalDeadline:
+    """Дедлайн доводки после окна research: общий остаток (deadline.left(), а не окно research) минус запас на
+    бленд, запись и проверку файла."""
+
+    def __init__(self, parent: Any, reserve: float) -> None:
+        self._parent, self._reserve = parent, reserve
+
+    def left(self) -> float:
+        left = getattr(self._parent, "left", None) if self._parent is not None else None
+        try:
+            total = float(left()) if callable(left) else math.inf
+        except Exception:
+            total = math.inf
+        return max(0.0, total - self._reserve)
+
+    def stage(self, name: str) -> float:
+        return self.left()
+
+
+def _honest_cv(cand: Any) -> float | None:
+    """Честная оценка кандидата fallback (meta["honest"], иначе cv_score_post) — для лога; None — нет кандидата."""
+    meta = (getattr(cand, "meta", None) or {}) if cand is not None else {}
+    value = (meta.get("honest") or {}).get("cv_score_post", meta.get("cv_score_post"))
+    return float(value) if value is not None else None
+
+
 def _read_usage(llm: Any) -> tuple[int, int] | None:
     """Счётчик токенов клиента (P2), если он его отдаёт: словарь usage, объект usage или атрибуты."""
     usage = getattr(llm, "usage", None)
@@ -1275,30 +1304,36 @@ class _Research:
             self._prepare()
             if not self._init_reference():
                 return []
-            while True:
-                self.stop_reason = self._stop_reason()
-                if self.stop_reason.startswith("plateau") and self._queue_auto_strategy():
-                    self.stop_reason = ""
-                if self.stop_reason:
-                    break
-                if not self.queue:
-                    self._maybe_critic()
-                    self._plan()
-                    if not self.queue:
-                        self.empty_plans += 1
-                        if self.empty_plans >= self.cfg.max_empty_plans and not self._queue_auto_strategy():
-                            self.stop_reason = "planner gives no new hypotheses"
-                            break
-                        continue
-                    self.empty_plans = 0
-                self._iterate(self.queue.popleft())
+            try:
+                self._loop()
+            except LLMUnavailable:
+                self.stop_reason = "LLM unavailable"
+                self.finalize()  # без LLM; до _finish — пока входные таблицы песочницы на диске
+                raise
             self.postprocess()
+            self.finalize()
             return self.result()
-        except LLMUnavailable:
-            self.stop_reason = "LLM unavailable"
-            raise
         finally:
             self._finish()
+
+    def _loop(self) -> None:
+        while True:
+            self.stop_reason = self._stop_reason()
+            if self.stop_reason.startswith("plateau") and self._queue_auto_strategy():
+                self.stop_reason = ""
+            if self.stop_reason:
+                break
+            if not self.queue:
+                self._maybe_critic()
+                self._plan()
+                if not self.queue:
+                    self.empty_plans += 1
+                    if self.empty_plans >= self.cfg.max_empty_plans and not self._queue_auto_strategy():
+                        self.stop_reason = "planner gives no new hypotheses"
+                        break
+                    continue
+                self.empty_plans = 0
+            self._iterate(self.queue.popleft())
 
     def _queue_auto_strategy(self) -> bool:
         """Перед остановкой (плато, пустой план): один раз выбор модели, затем один раз подбор её параметров."""
@@ -1368,6 +1403,49 @@ class _Research:
             self.memory.dump_jsonl(self.workdir / "experiments.jsonl")
         except Exception as error:  # постобработка — бонус, а не обязательный шаг
             log.warning("research: postprocess failed: %s: %s", type(error).__name__, P.clip(str(error), 300))
+
+    def finalize(self) -> None:
+        """Конец исследования поверх рецепта fallback: лучший принятый кандидат переобучается с теми же сидами, что
+        итог fallback (evaluate.bag, bag_seeds), и добавляется к принятым.
+
+        Итог fallback усреднён по 3 сидам, кандидаты агента — один сид: без доводки агент проигрывал бы записанному
+        сабмиту на шуме сида, а не на качестве признаков. Время — после окна research, с запасом
+        final_reserve_seconds до конца 3 часов; не успеваем по оценке — пропуск (кандидат с одним сидом остаётся).
+        """
+        cfg = self.cfg
+        bag = getattr(self.evaluate, "bag", None)
+        seeds = int(getattr(self.evaluate, "bag_seeds", 1) or 1)
+        current = self.current
+        if (not cfg.bag_best or not self.recipe or seeds <= 1 or not callable(bag) or not self.accepted
+                or current is not self.accepted[-1] or (current.meta or {}).get("bagged_seeds")):
+            return
+        deadline = _FinalDeadline(self.deadline, cfg.final_reserve_seconds)
+        need = (seeds - 1) * self.reference_seconds * 1.25
+        if need > deadline.left():
+            log.info("research: bagging of %s skipped: needs ~%.0fs, %.0fs left before the final reserve",
+                     current.name, need, deadline.left())
+            return
+        start = time.monotonic()
+        try:
+            features = run_features(self.base_code, self.workdir / "exp_final_bag", self.inputs, self.data, cfg,
+                                    self.run_code, timeout=min(cfg.features_timeout, max(1.0, deadline.left())))
+            if features.error:
+                log.warning("research: bagging skipped, features failed: %s", P.clip(features.error, 300))
+                return
+            bagged = bag(self.spec, make_build_features(features.x_train, features.x_test), current, deadline)
+        except Exception as error:  # доводка — бонус: кандидат с одним сидом уже есть
+            log.warning("research: bagging failed: %s: %s", type(error).__name__, P.clip(str(error), 300))
+            return
+        if bagged is None or not math.isfinite(float(getattr(bagged, "cv_score", math.nan))):
+            return
+        bagged.name = f"{current.name}_bag{seeds}"
+        keep = ("code", "model", "params", "target_transform", "n_features", "hypothesis", "kind", "iter", "gain",
+                "seconds")
+        bagged.meta.update({k: current.meta[k] for k in keep if k in current.meta})
+        self.accepted.append(bagged)
+        sign = 1.0 if self.greater else -1.0
+        log.info("research: %s cv=%.6g (one seed %.6g, %+.4g) in %.0fs", bagged.name, bagged.cv_score,
+                 current.cv_score, sign * (bagged.cv_score - current.cv_score), time.monotonic() - start)
 
     def result(self) -> list[Candidate]:
         """Принятые кандидаты по убыванию качества; при only_better_than_best — не хуже входного best."""
@@ -1443,11 +1521,11 @@ class _Research:
         if cand is None:
             log.warning("research: fallback recipe failed, stopping: %s", P.clip(error, 500))
             return False
+        reported = _honest_cv(self.best)  # итог fallback (до замены best на эталон рецепта)
         self.base_code, self.current, self.best = BASE_CODE_EXTRA, cand, cand  # результат — не хуже рецепта
-        fallback_cv = (getattr(self.best, "meta", None) or {}).get("cv_score_post")
-        log.info("research: reference = fallback recipe %s=%.5g (fallback reported %s), %.0fs",
+        log.info("research: reference = fallback recipe %s=%.5g, one seed, honest (fallback result %s), %.0fs",
                  self.data.spec_dict["metric"], cand.cv_score,
-                 f"{float(fallback_cv):.5g}" if fallback_cv is not None else "n/a", self.reference_seconds)
+                 f"{reported:.5g}" if reported is not None else "n/a", self.reference_seconds)
         self._update_errors()
         return True
 
