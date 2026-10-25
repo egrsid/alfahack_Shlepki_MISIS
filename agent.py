@@ -35,7 +35,8 @@ import pandas as pd
 
 import prompts_agent as P
 # Candidate — из schemas.py (P1), если он есть
-from agent_eval import Candidate, LocalEvaluator, RecipeEvaluator, ScreenEvaluator, find_file, recipe_signals
+from agent_eval import (WEIGHT_SCHEMES, Candidate, LocalEvaluator, RecipeEvaluator, ScreenEvaluator, find_file,
+                        recipe_signals, row_weights)
 from error_analysis import analyze_errors
 from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
 from postprocess import apply_weights, fit_class_weights
@@ -1074,6 +1075,74 @@ def useless_new_columns(x_train: pd.DataFrame, raw_train: pd.DataFrame, max_new:
     return drop, notes, ""
 
 
+def action_state(kind: str, action: dict, state: dict, columns: list[str], data: Any) -> tuple[dict | None, str]:
+    """Действие гипотезы + текущее состояние рецепта → (новое состояние, "") или (None, ошибка для LLM).
+
+    drop — исходные колонки исключаются из всех моделей рецепта (до 10 за раз); weights — схема весов строк
+    обучения (заменяет прежнюю); target_stats — до 2 ключей по 1–3 исходные колонки, всего не больше 4 ключей.
+    data — данные fallback (ctx.data): проверка, применима ли схема весов.
+    """
+    state = {k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
+             for k, v in (state or {}).items()}
+    known = set(columns)
+    if kind == "drop":
+        drop = action.get("drop")
+        drop = [drop] if isinstance(drop, str) else drop
+        if not isinstance(drop, list) or not drop or not all(isinstance(c, str) for c in drop):
+            return None, 'drop: expected {"drop": ["column", ...]}'
+        unknown = [c for c in drop if c not in known]
+        if unknown:
+            return None, f"drop: unknown columns {unknown[:5]}"
+        if len(drop) > 10:
+            return None, f"drop: at most 10 columns at once, got {len(drop)}"
+        merged = sorted(set(state.get("drop", [])) | set(drop))
+        if len(merged) >= len(known):
+            return None, "drop: cannot drop every column"
+        state["drop"] = merged
+        return state, ""
+    if kind == "weights":
+        scheme = str(action.get("scheme") or "").lower().strip()
+        if scheme not in WEIGHT_SCHEMES:
+            return None, f"weights: scheme must be one of {list(WEIGHT_SCHEMES)}, got {scheme!r}"
+        try:
+            power = float(action.get("power", 1.0))
+        except (TypeError, ValueError):
+            return None, "weights: power must be a number"
+        weights = {"scheme": scheme, "power": round(min(3.0, max(0.25, power)), 3)}
+        try:
+            row_weights(data, weights)
+        except ValueError as error:
+            return None, f"weights: {error}"
+        state["weights"] = weights
+        return state, ""
+    if kind == "target_stats":
+        keys = action.get("keys")
+        if isinstance(keys, list) and keys and all(isinstance(c, str) for c in keys):
+            keys = [keys]  # один ключ без внешнего списка
+        if not isinstance(keys, list) or not keys or len(keys) > 2 or not all(
+                isinstance(k, list) and 1 <= len(k) <= 3 and all(isinstance(c, str) for c in k) for k in keys):
+            return None, 'target_stats: expected {"keys": [["col_a", "col_b"]]} — 1–2 keys of 1–3 columns'
+        unknown = sorted({c for k in keys for c in k if c not in known})
+        if unknown:
+            return None, f"target_stats: unknown columns {unknown[:5]}"
+        merged = [list(k) for k in state.get("target_keys", [])]
+        for key in keys:
+            if sorted(key) not in [sorted(k) for k in merged]:
+                merged.append(list(key))
+        if len(merged) > 4:
+            return None, "target_stats: at most 4 keys in total"
+        if len(merged) == len(state.get("target_keys", [])):
+            return None, "target_stats: these keys are already used"
+        state["target_keys"] = merged
+        return state, ""
+    return None, f"unknown action kind {kind!r}"
+
+
+def state_text(state: dict) -> str:
+    """Состояние рецепта одной строкой — для памяти экспериментов и отпечатка эксперимента."""
+    return json.dumps(state or {}, sort_keys=True, ensure_ascii=False)
+
+
 def make_build_features(x_train: pd.DataFrame, x_test: pd.DataFrame) -> Callable:
     """build_features для evaluator.evaluate: код LLM уже исполнен в песочнице, отдаём готовые признаки."""
     def build_features(train: Any, test: Any, spec: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1297,6 +1366,7 @@ class Hypothesis:
     expected_gain: str = "mid"
     cost: str = "mid"
     id: str = ""
+    action: dict = field(default_factory=dict)  # режим рецепта: действие над рецептом (drop / weights / target_stats)
 
 
 _KIND_ALIASES = {"feature": "features", "feature_engineering": "features", "interaction": "features",
@@ -1343,7 +1413,8 @@ def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int
             continue
         kind = re.sub(r"[\s-]+", "_", str(item.get("kind") or item.get("type") or "features").lower().strip())
         strategies = (P.TUNE_KIND, P.MODEL_SEARCH_KIND)
-        kind = kind if kind in P.KINDS or kind in strategies else _KIND_ALIASES.get(kind, "features")
+        kind = (kind if kind in P.KINDS or kind in strategies or kind in P.ACTION_KINDS
+                else _KIND_ALIASES.get(kind, "features"))
         if kind == P.TUNE_KIND and not can_tune:
             kind = "params"
         if kind == P.MODEL_SEARCH_KIND and not can_search_models:
@@ -1357,11 +1428,18 @@ def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int
             level = str(item.get(field_name) or "mid").lower().strip()
             level = _LEVEL_ALIASES.get(level, level)
             levels.append(level if level in _LEVELS else "mid")
+        action = {}
+        if kind in P.ACTION_KINDS:  # действие — JSON в "action" (или прямо в гипотезе: {"drop": [...]})
+            action = item.get("action") if isinstance(item.get("action"), dict) else {
+                k: item[k] for k in ("drop", "scheme", "power", "keys") if k in item}
+            if not action:
+                continue
         if is_duplicate is not None and is_duplicate(title, kind):
             continue
         seen.add(key)
         result.append(Hypothesis(title=title[:200], kind=kind, rationale=str(item.get("rationale") or "")[:400],
-                                 expected_gain=levels[0], cost=levels[1], id=str(item.get("id") or "")))
+                                 expected_gain=levels[0], cost=levels[1], id=str(item.get("id") or ""),
+                                 action=action))
     result.sort(key=lambda h: -_LEVELS[h.expected_gain] / _LEVELS[h.cost])
     return result[:max_n], analysis
 
@@ -1389,6 +1467,7 @@ class _Research:
         self.hidden = (getattr(evaluate, "holdout_fold", None)
                        if cfg.holdout and getattr(evaluate, "recipe_mode", False) else None)
         self.full_evals = 0
+        self.recipe_state: dict = {}      # накопленные действия агента над рецептом (drop / weights / target_keys)
         self.pool: list[Candidate] = []   # не принятые, но не хуже текущего больше шума — для финального бленда
         self.near_misses: list[int] = []  # id экспериментов «выигрыш > 0, но ниже порога», ещё не объединённые
         self.filter_notes: list[str] = []
@@ -1865,6 +1944,8 @@ class _Research:
         base = code_hash(self.base_code)
 
         def is_duplicate(title: str, kind: str) -> bool:
+            if kind in P.ACTION_KINDS:  # действия сравниваются по содержанию (диффу), а не по названию
+                return False
             if kind == P.MODEL_SEARCH_KIND:  # название не важно: важно, от какого кода сравнивали модели
                 if any(k == kind for _, k in pending) or any(
                         e.kind == kind and e.base_hash == base for e in self.memory.experiments):
@@ -1927,7 +2008,13 @@ class _Research:
                                       temperature=cfg.code_temperature))
 
     # ---------------------------------------------------------------- эксперимент
-    def _evaluate_code(self, code: str, name: str, screen: bool = False) -> tuple[Candidate | None, str]:
+    def _digest(self, code: str, state: dict | None = None) -> str:
+        """Отпечаток эксперимента: код признаков + состояние рецепта (действия меняют рецепт, а не код)."""
+        state = self.recipe_state if state is None else state
+        return code_hash(code + ("\n# recipe " + state_text(state) if state else ""))
+
+    def _evaluate_code(self, code: str, name: str, screen: bool = False, state: dict | None = None,
+                       action: bool = False) -> tuple[Candidate | None, str]:
         """Проверка кода → песочница → проверка признаков → [скрининг] → evaluator. (кандидат, "") или (None, ошибка).
 
         screen=True и есть скрининг: гипотеза, не прошедшая его, — (None, "screen: ...") без полной оценки
@@ -1946,7 +2033,8 @@ class _Research:
         if features.error:
             return None, features.error
         self.filter_notes = []
-        if self.recipe and name != "exp_00_base":
+        state = self.recipe_state if state is None else state
+        if self.recipe and name != "exp_00_base" and not action:
             drop, notes, problem = useless_new_columns(features.x_train, self.data.train_x, cfg.max_new_columns,
                                                        cache=self.rank_cache)
             if problem:
@@ -1960,7 +2048,7 @@ class _Research:
         self.last_features = (features.x_train, features.x_test)
         self.screen_decision = None
         if screen and self.screen is not None:
-            verdict = self._screen_check(features)
+            verdict = self._screen_check(features, state)
             if verdict:
                 return None, verdict
         if self._left() < max(10.0, 0.5 * self.reference_seconds):
@@ -1968,7 +2056,8 @@ class _Research:
         try:
             budget = _SubDeadline(self.deadline, min(cfg.evaluate_timeout, self._left()))
             cand = self.evaluate(self.spec, make_build_features(features.x_train, features.x_test),
-                                 {"model": model, "params": params, "target_transform": transform}, budget)
+                                 {"model": model, "params": params, "target_transform": transform,
+                                  **({"recipe_state": state} if self.recipe else {})}, budget)
         except Exception as error:
             return None, f"evaluation failed: {type(error).__name__}: {P.clip(str(error), 1000)}"
         if cand is None or not math.isfinite(float(getattr(cand, "cv_score", math.nan))):
@@ -1983,20 +2072,21 @@ class _Research:
 
     def _screen_reference(self) -> Candidate | None:
         """Скрининг признаков текущего лучшего кода (кэш по его хэшу); None — посчитать не удалось."""
-        digest = code_hash(self.base_code)
+        digest = self._digest(self.base_code)
         if self.screen_ref is not None and self.screen_ref_hash == digest:
             return self.screen_ref
         if self.base_features is None:
             return None
         start = time.monotonic()
         budget = _SubDeadline(self.deadline, min(self.cfg.evaluate_timeout, self._left()))
-        self.screen_ref = self.screen(self.spec, make_build_features(*self.base_features), {}, budget)
+        self.screen_ref = self.screen(self.spec, make_build_features(*self.base_features),
+                                      {"recipe_state": self.recipe_state}, budget)
         self.screen_ref_hash = digest
         log.info("research: screen reference (%s) %s=%.5g, %.0fs", getattr(self.screen, "name", "screen"),
                  self.data.spec_dict["metric"], self.screen_ref.cv_score, time.monotonic() - start)
         return self.screen_ref
 
-    def _screen_check(self, features: FeatureOutcome) -> str:
+    def _screen_check(self, features: FeatureOutcome, state: dict | None = None) -> str:
         """Быстрая оценка признаков гипотезы против эталона скрининга. "" — полная оценка нужна (выигрыш больше
         screen_k · шум, или скрининг не удался); иначе причина отказа "screen: ..."."""
         cfg = self.cfg
@@ -2006,7 +2096,8 @@ class _Research:
             if reference is None:
                 return ""
             budget = _SubDeadline(self.deadline, min(cfg.evaluate_timeout, self._left()))
-            cand = self.screen(self.spec, make_build_features(features.x_train, features.x_test), {}, budget)
+            cand = self.screen(self.spec, make_build_features(features.x_train, features.x_test),
+                               {"recipe_state": self.recipe_state if state is None else state}, budget)
         except Exception as error:  # скрининг — ускорение, а не обязательный шаг
             log.info("research: screening failed (%s: %s) — full evaluation", type(error).__name__,
                      P.clip(str(error), 200))
@@ -2029,8 +2120,15 @@ class _Research:
         cand: Candidate | None = None
         decision: Decision | None = None
         note = ""  # итог стратегии (какие модели сравнили) — в память рядом с решением
+        state = self.recipe_state
+        is_action = self.recipe and hypothesis.kind in P.ACTION_KINDS
         try:
-            if hypothesis.kind == P.TUNE_KIND:
+            if is_action:  # действие над рецептом: кода нет — тот же код признаков, новое состояние рецепта
+                state, error = action_state(hypothesis.kind, hypothesis.action, self.recipe_state,
+                                            list(self.data.train_x.columns), self.evaluate.ctx.data)
+                code = self.base_code if state is not None else None
+                repairs = cfg.max_repairs  # чинить нечего: ошибку действия LLM увидит в памяти
+            elif hypothesis.kind == P.TUNE_KIND:
                 code, error = self._tuned_code(n)
                 repairs = cfg.max_repairs  # чинить нечего: код писал не LLM
             elif hypothesis.kind == P.MODEL_SEARCH_KIND:
@@ -2045,14 +2143,14 @@ class _Research:
                 repairs = 0
             while code is not None and cand is None:
                 last_code = code
-                digest = code_hash(code)
+                digest = self._digest(code, state)
                 same = self.memory.find_code(digest)
-                if digest == code_hash(self.base_code) or same is not None:
+                if digest == self._digest(self.base_code) or same is not None:
                     status = "rejected"
                     error = (f"same code as experiment #{same.id}" if same is not None
                              else "no change vs the current best code")
                     break
-                cand, error = self._evaluate_code(code, f"exp_{n:02d}", screen=True)
+                cand, error = self._evaluate_code(code, f"exp_{n:02d}", screen=True, state=state, action=is_action)
                 if cand is None and error.startswith(REJECTS):
                     status, decision = "rejected", self.screen_decision
                     break
@@ -2096,8 +2194,10 @@ class _Research:
             gain=decision.gain if decision is not None else None, code_hash=digest, error=error[:1000],
             duration_s=round(duration, 1), tokens_in=self.tokens_in - tokens_in,
             tokens_out=self.tokens_out - tokens_out, columns=self._touched_columns(changed),
-            diff=code_diff(base_code, last_code) if last_code else "", base_hash=code_hash(base_code)))
-        if near_miss and decision.gain > 0 and not hypothesis.title.startswith(COMBINE_PREFIX):
+            diff=(f"action {hypothesis.kind}: {state_text(hypothesis.action)}" if is_action
+                  else code_diff(base_code, last_code) if last_code else ""), base_hash=code_hash(base_code)))
+        if (near_miss and decision.gain > 0 and not is_action
+                and not hypothesis.title.startswith(COMBINE_PREFIX)):
             self.near_misses.append(self.memory.experiments[-1].id)
         if hypothesis.kind not in (P.TUNE_KIND, P.MODEL_SEARCH_KIND):  # у стратегий свой бюджет времени
             self.durations.append(duration)
@@ -2245,6 +2345,8 @@ class _Research:
         self.accepted.append(cand)
         self.current, self.base_code = cand, cand.meta["code"]
         self.base_features = self.last_features
+        if self.recipe:
+            self.recipe_state = dict(cand.meta.get("recipe_state") or {})
         self._update_errors()
         return "accepted", decision.reason
 

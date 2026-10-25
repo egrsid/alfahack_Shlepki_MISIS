@@ -370,6 +370,49 @@ def holdout_fold(data: Any) -> int | None:
     return n - 1
 
 
+# ============================================================ действия агента над рецептом
+
+RECIPE_ACTIONS = ("drop", "weights", "target_stats")  # кроме features: их исполняет харнесс, LLM пишет только JSON
+WEIGHT_SCHEMES = ("dedup", "recency", "class")
+
+
+def row_weights(data: Any, weights: dict | None) -> np.ndarray | None:
+    """Веса строк train для действия weights (среднее 1); None — без весов. ValueError — схема неприменима.
+
+    dedup — 1 / размер группы одинаковых строк (в test близнецов нет, а частые шаблоны в train переучиваются);
+    recency — (1 + номер периода)^power (test — новый период: поздние ближе к нему);
+    class — (n / (k · n_класса))^power (power 0.5 — «sqrt», 1 — «balanced»); у dedup power смягчает так же.
+    """
+    if not weights:
+        return None
+    scheme, power = weights.get("scheme"), float(weights.get("power", 1.0))
+    if scheme == "dedup":
+        hashes = pd.util.hash_pandas_object(data.prep.X, index=False).to_numpy()
+        _, inverse, counts = np.unique(hashes, return_inverse=True, return_counts=True)
+        if counts.max() <= 1:
+            raise ValueError("dedup weights: train has no duplicate rows")
+        w = (1.0 / counts[inverse]) ** power
+    elif scheme == "recency":
+        if getattr(data, "period_order", None) is None:
+            raise ValueError("recency weights need a period CV scheme (test is a new period)")
+        ranks = pd.Series(np.asarray(data.period_order, dtype=float)).rank(method="dense").to_numpy() - 1
+        w = (1.0 + np.nan_to_num(ranks)) ** power
+    elif scheme == "class":
+        if data.task == "regression":
+            raise ValueError("class weights need a classification task")
+        counts = np.bincount(np.asarray(data.y, dtype=int), minlength=len(data.classes)).astype(float)
+        w = (len(data.y) / (len(counts) * np.maximum(counts, 1.0)))[np.asarray(data.y, dtype=int)] ** power
+    else:
+        raise ValueError(f"unknown weights scheme {scheme!r}, use one of {WEIGHT_SCHEMES}")
+    return w / w.mean()
+
+
+def drop_columns(columns: Any, drop: Any, renamed: dict) -> tuple[str, ...]:
+    """Колонки матрицы fallback, происходящие из исходных колонок drop (в т. ч. производные «col__freq»)."""
+    drop = set(drop or ())
+    return tuple(c for c in columns if _raw_name(c, renamed) in drop) if drop else ()
+
+
 class RecipeEvaluator:
     """evaluator.evaluate(spec, build_features, cfg, deadline) -> Candidate на рецепте лучшего кандидата fallback.
 
@@ -390,7 +433,8 @@ class RecipeEvaluator:
 
     recipe_mode = True
 
-    def __init__(self, best: Any, threads: int | None = None, decision_seconds: float = 20.0) -> None:
+    def __init__(self, best: Any, threads: int | None = None, decision_seconds: float = 20.0,
+                 fast: bool = True) -> None:
         ctx = (getattr(best, "meta", None) or {}).get("context")
         if ctx is None:
             raise ValueError("fallback candidate has no context")
@@ -405,6 +449,12 @@ class RecipeEvaluator:
         self.base_oofs = {r.name: r.oof for r in ctx.runs}
         self.bag_seeds = int((getattr(best, "meta", None) or {}).get("bagged_seeds") or 1)
         self.holdout_fold = holdout_fold(ctx.data)
+        # «быстрый рецепт»: медленный член с малым весом не переобучается — его OOF/test из fallback как есть
+        # (public-мультикласс: CatBoost 240 с при весе 0.17 — эталон рецепта шёл 910 с вместо ~300)
+        seconds = {name: float(self.runs[name].seconds) for name in self.members}
+        median = float(np.median(list(seconds.values())))
+        self.frozen = ({name for name, sec in seconds.items() if sec > 1.5 * median and self.members[name] <= 0.25}
+                       if fast and len(self.members) >= 3 else set())
         self.threads = threads
         self.calls = 0
         self._inputs: tuple[pd.DataFrame, pd.DataFrame, dict] | None = None
@@ -458,20 +508,40 @@ class RecipeEvaluator:
                                 cats if key == "randomforest" else [*cats, *cat_new])
         return data, new
 
-    def _fit(self, data: Any, seeds: tuple[int, ...], deadline: Any) -> tuple[np.ndarray, np.ndarray, Any]:
+    def action_args(self, spec: Any, data: Any, run: Any, state: dict | None) -> dict:
+        """Аргументы fallback.cv_model для состояния рецепта (накопленные действия агента): exclude с колонками
+        действия drop, sample_weight действия weights, target_keys действия target_stats."""
+        import fallback
+
+        state = state or {}
+        renamed = self.ctx.data.prep.report.get("renamed", {})
+        columns = data.frame(run.model)[0].columns
+        keys = []
+        if state.get("target_keys"):
+            train, test, _ = self._raw(spec)
+            keys = [(fallback._entity_key(train, list(cols)), fallback._entity_key(test, list(cols)))
+                    for cols in state["target_keys"]]
+        return {"exclude": tuple(run.exclude) + drop_columns(columns, state.get("drop"), renamed),
+                "sample_weight": row_weights(self.ctx.data, state.get("weights")), "target_keys": keys}
+
+    def _fit(self, data: Any, seeds: tuple[int, ...], deadline: Any, spec: Any = None,
+             state: dict | None = None) -> tuple[np.ndarray, np.ndarray, Any]:
         """Члены рецепта, каждый усреднён по seeds (0 — сид fallback, k — сид fallback + k, как в его bag3):
-        (OOF с весами рецепта, test_pred, честный OOF по весам фолдов или None)."""
+        (OOF с весами рецепта, test_pred, честный OOF по весам фолдов или None). Замороженные — из fallback."""
         import fallback
 
         ctx = self.ctx
         threads = self.threads or fallback.n_threads()
         oof = test_pred = None
         member_oofs: dict[str, np.ndarray] = {}
-        jobs, done = len(self.members) * len(seeds), 0
+        jobs, done = (len(self.members) - len(self.frozen)) * len(seeds), 0
         for name, weight in self.members.items():
             run = self.runs[name]
             oofs, tests = [], []
-            for seed in seeds:
+            if name in self.frozen:
+                oofs, tests = [run.oof], [run.test_pred]
+            args = self.action_args(spec, data, run, state) if name not in self.frozen else {}
+            for seed in (() if name in self.frozen else seeds):
                 left = _left(deadline)
                 if left <= 0:
                     raise TimeoutError(f"evaluation stopped before member {name}")
@@ -480,7 +550,7 @@ class RecipeEvaluator:
                 if seed:
                     extra.update(fallback.seed_params(run.model, ctx.config.seed + seed))
                 fitted = fallback.cv_model(data, name, run.model, ctx.config, stop_at, transform=run.transform,
-                                           extra=extra, threads=threads, exclude=run.exclude, entity=run.entity)
+                                           extra=extra, threads=threads, entity=run.entity, **args)
                 oofs.append(fitted.oof)
                 tests.append(fitted.test_pred)
                 done += 1
@@ -494,7 +564,7 @@ class RecipeEvaluator:
         return oof, test_pred, honest
 
     def _candidate(self, data: Any, new: list[str], oof: np.ndarray, test_pred: np.ndarray, honest: Any,
-                   seeds: int) -> Candidate:
+                   seeds: int, state: dict | None = None) -> Candidate:
         import fallback
 
         ctx = self.ctx
@@ -504,7 +574,8 @@ class RecipeEvaluator:
         cand = fallback.honest_view(cand)  # честная оценка: oof и оценки фолдов — по весам без этого фолда
         eff = [float(s) for s in cand.meta["fold_scores_eff"]]
         cand.meta.update(fold_scores_raw=cand.meta["fold_scores"], fold_scores=eff, fold_ids=data.folds,
-                         new_columns=new, evaluator="recipe", seeds=seeds,
+                         new_columns=new, evaluator="recipe", seeds=seeds, recipe_state=dict(state or {}),
+                         frozen=sorted(self.frozen),
                          recipe_raw={"oof": oof, "test_pred": test_pred, "honest": honest})
         if seeds > 1:
             cand.meta["bagged_seeds"] = seeds
@@ -513,9 +584,10 @@ class RecipeEvaluator:
 
     def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
         self.calls += 1
+        state = (params or {}).get("recipe_state") or {}
         data, new = self._frames(spec, build_features)
-        oof, test_pred, honest = self._fit(data, (0,), deadline)
-        return self._candidate(data, new, oof, test_pred, honest, 1)
+        oof, test_pred, honest = self._fit(data, (0,), deadline, spec, state)
+        return self._candidate(data, new, oof, test_pred, honest, 1, state)
 
     def bag(self, spec: Any, build_features: Any, base: Any, deadline: Any = None) -> Candidate:
         """base — кандидат этого evaluator на тех же колонках (сид fallback); дообучаются сиды 1..bag_seeds−1 и
@@ -524,16 +596,17 @@ class RecipeEvaluator:
         if raw is None or self.bag_seeds <= 1:
             raise ValueError("nothing to bag: no recipe_raw in the base candidate or bag_seeds <= 1")
         self.calls += 1
+        state = base.meta.get("recipe_state") or {}
         data, new = self._frames(spec, build_features)
         extra = tuple(range(1, self.bag_seeds))
-        oof, test_pred, honest = self._fit(data, extra, deadline)
+        oof, test_pred, honest = self._fit(data, extra, deadline, spec, state)
         n, total = len(extra), len(extra) + 1
 
         def average(first: Any, rest: Any) -> Any:
             return None if first is None or rest is None else (first + n * rest) / total
 
         return self._candidate(data, new, average(raw["oof"], oof), average(raw["test_pred"], test_pred),
-                               average(raw["honest"], honest), total)
+                               average(raw["honest"], honest), total, state)
 
 
 class ScreenEvaluator:
@@ -552,7 +625,7 @@ class ScreenEvaluator:
     """
 
     def __init__(self, recipe: RecipeEvaluator, seeds: int = 2, max_rounds: int = 300, min_rounds: int = 50,
-                 threads: int | None = None) -> None:
+                 threads: int | None = None, max_train_rows: int = 30_000, seed_seconds: float = 30.0) -> None:
         import fallback
 
         runs = [r for r in recipe.ctx.runs if r.model == "lightgbm" and r.iterations]
@@ -568,13 +641,23 @@ class ScreenEvaluator:
         self.rounds = min(rounds, max_rounds)
         base_lr = float(self.run.params.get("learning_rate", fallback._lr(len(recipe.ctx.data.y))))
         self.learning_rate = min(0.3, base_lr * rounds / self.rounds)
-        self.recipe, self.seeds = recipe, max(1, int(seeds))
+        data = recipe.ctx.data
+        rows = len(data.y) * (data.n_splits - 1) / data.n_splits  # строк обучения в фолде
+        # большая задача: подвыборка строк обучения фолда (валидация — целиком); public-мультикласс: 70 тыс. строк ×
+        # 10 классов — скрининг шёл 312 с на гипотезу
+        self.max_rows = max_train_rows if rows > 2 * max_train_rows else None
+        # оценка одного сида по времени этого LightGBM у fallback; долго — один сид (быстрее, но шумнее)
+        share = (self.max_rows / rows) if self.max_rows else 1.0
+        estimate = float(self.run.seconds) * self.rounds / max(1, rounds) * share
+        self.recipe = recipe
+        self.seeds = max(1, int(seeds)) if estimate <= seed_seconds else 1
         self.threads = threads or recipe.threads
         self.calls = 0
 
     @property
     def name(self) -> str:
-        return f"{self.run.name}, {self.rounds} trees, lr {self.learning_rate:.3g}, {self.seeds} seeds"
+        rows = f", ≤ {self.max_rows} train rows" if self.max_rows else ""
+        return f"{self.run.name}, {self.rounds} trees, lr {self.learning_rate:.3g}, {self.seeds} seeds{rows}"
 
     def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
         import fallback
@@ -582,6 +665,7 @@ class ScreenEvaluator:
         self.calls += 1
         run, ctx = self.run, self.recipe.ctx
         data, new = self.recipe._frames(spec, build_features, models=[run.model])
+        args = self.recipe.action_args(spec, data, run, (params or {}).get("recipe_state"))
         threads = self.threads or fallback.n_threads()
         oofs, tests = [], []
         for seed in range(self.seeds):
@@ -592,8 +676,8 @@ class ScreenEvaluator:
             extra = {**(getattr(run, "extra", None) or {}), "n_estimators": self.rounds,
                      "learning_rate": self.learning_rate, **fallback.seed_params(run.model, ctx.config.seed + seed)}
             fitted = fallback.cv_model(data, f"screen_{run.name}", run.model, ctx.config, stop_at,
-                                       transform=run.transform, extra=extra, threads=threads, exclude=run.exclude,
-                                       entity=run.entity, early_stopping=0)
+                                       transform=run.transform, extra=extra, threads=threads, entity=run.entity,
+                                       early_stopping=0, max_train_rows=self.max_rows, **args)
             oofs.append(fitted.oof)
             tests.append(fitted.test_pred)
         oof, test_pred = sum(oofs) / len(oofs), sum(tests) / len(tests)

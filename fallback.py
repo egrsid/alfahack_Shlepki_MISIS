@@ -407,21 +407,56 @@ def entity_features(data: "TaskData", train_idx: np.ndarray, valid_idx: np.ndarr
 
 
 def _entity_level(data: "TaskData", key: np.ndarray, key_test: np.ndarray, train_idx: np.ndarray,
-                  valid_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                  valid_idx: np.ndarray, stats: Any = None, width: int = len(ENTITY_FEATURES)
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Статистики таргета по ключу без утечки (см. entity_features); stats(key_src, y_src, key_dst) -> (n, width)."""
+    stats = stats or _entity_stats
     y, order = data.y, data.period_order
     groups = order if order is not None else data.folds
-    feat_tr = np.zeros((len(train_idx), len(ENTITY_FEATURES)))
+    feat_tr = np.zeros((len(train_idx), width))
     for g in np.unique(groups[train_idx]):
         rows = train_idx[groups[train_idx] == g]
         src = train_idx[groups[train_idx] < g] if order is not None else train_idx[groups[train_idx] != g]
-        feat_tr[np.searchsorted(train_idx, rows)] = _entity_stats(key[src], y[src], key[rows])
-    feat_va = np.zeros((len(valid_idx), len(ENTITY_FEATURES)))
+        feat_tr[np.searchsorted(train_idx, rows)] = stats(key[src], y[src], key[rows])
+    feat_va = np.zeros((len(valid_idx), width))
     for g in np.unique(groups[valid_idx]):
         rows = valid_idx[groups[valid_idx] == g]
         src = train_idx[groups[train_idx] < g] if order is not None else train_idx
-        feat_va[np.searchsorted(valid_idx, rows)] = _entity_stats(key[src], y[src], key[rows])
-    feat_te = _entity_stats(key[train_idx], y[train_idx], key_test)  # для test весь train — прошлое
+        feat_va[np.searchsorted(valid_idx, rows)] = stats(key[src], y[src], key[rows])
+    feat_te = stats(key[train_idx], y[train_idx], key_test)  # для test весь train — прошлое
     return feat_tr, feat_va, feat_te
+
+
+def _class_stats(n_classes: int) -> Any:
+    """Статистики ключа для классификации: доли каждого класса и число строк с этим ключом."""
+    def stats(key_src: np.ndarray, y_src: np.ndarray, key_dst: np.ndarray) -> np.ndarray:
+        if not len(key_src):
+            return np.column_stack([np.full((len(key_dst), n_classes), np.nan), np.zeros(len(key_dst))])
+        onehot = pd.DataFrame(np.eye(n_classes)[np.asarray(y_src, dtype=int)], columns=range(n_classes))
+        onehot["k"] = key_src
+        table = onehot.groupby("k", sort=False).agg(["mean"]).droplevel(1, axis=1)
+        table["count"] = onehot.groupby("k", sort=False).size()
+        out = table.reindex(key_dst).to_numpy(dtype=float)
+        out[:, -1] = np.nan_to_num(out[:, -1])
+        return out
+    return stats
+
+
+def target_key_names(index: int, data: "TaskData") -> tuple[str, ...]:
+    """Имена признаков по таргету для ключа агента номер index."""
+    if data.task == "regression" or not data.classes or len(data.classes) == 2:
+        return tuple(f"tkey{index}__{stat}" for stat in ("mean", "count", "median"))
+    return tuple(f"tkey{index}__share{c}" for c in range(len(data.classes))) + (f"tkey{index}__count",)
+
+
+def target_key_features(data: "TaskData", key: np.ndarray, key_test: np.ndarray, train_idx: np.ndarray,
+                        valid_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Признаки по таргету для ключа, который выбрал агент (действие target_stats): та же защита от утечки, что у
+    признаков сущности; регрессия/бинарная — среднее/число/медиана, мультикласс — доли классов и число."""
+    if data.task == "regression" or not data.classes or len(data.classes) == 2:
+        return _entity_level(data, key, key_test, train_idx, valid_idx)
+    k = len(data.classes)
+    return _entity_level(data, key, key_test, train_idx, valid_idx, stats=_class_stats(k), width=k + 1)
 
 
 def choose_cv(train_x: pd.DataFrame, test_x: pd.DataFrame, y: np.ndarray, task: str, n_splits: int,
@@ -630,11 +665,14 @@ def _xgb_timer(stop_at: float):
 
 def _fit_predict(model: str, regression: bool, params: dict, x_tr: pd.DataFrame, y_tr: np.ndarray,
                  x_va: pd.DataFrame, y_va: np.ndarray, x_te: pd.DataFrame, cats: list[str],
-                 stop_at: float, early_stopping: int) -> tuple[np.ndarray, np.ndarray, int, list]:
+                 stop_at: float, early_stopping: int, sample_weight: np.ndarray | None = None
+                 ) -> tuple[np.ndarray, np.ndarray, int, list]:
     """Обучение на фолде; классификация — коды 0..m-1 только присутствующих классов (иначе XGBoost падает).
 
     early_stopping <= 0 — без ранней остановки: ровно n_estimators/iterations из params (быстрая оценка признаков
-    агентом: остановка по валидации добавляет к сравнению шум выбора итерации)."""
+    агентом: остановка по валидации добавляет к сравнению шум выбора итерации).
+    sample_weight — веса строк обучения (действие агента «weights»); валидация и ранняя остановка — без весов."""
+    fit_kw = {} if sample_weight is None else {"sample_weight": np.asarray(sample_weight, dtype=float)}
     present = None
     if not regression:
         present = np.unique(y_tr)
@@ -652,34 +690,35 @@ def _fit_predict(model: str, regression: bool, params: dict, x_tr: pd.DataFrame,
         est = cls(**params)
         if early_stopping > 0:
             est.fit(x_tr, y_tr, eval_set=[(x_es, y_es)],
-                    callbacks=[lgb.early_stopping(early_stopping, verbose=False), _lgb_timer(stop_at)])
+                    callbacks=[lgb.early_stopping(early_stopping, verbose=False), _lgb_timer(stop_at)], **fit_kw)
         else:
-            est.fit(x_tr, y_tr, callbacks=[_lgb_timer(stop_at)])
+            est.fit(x_tr, y_tr, callbacks=[_lgb_timer(stop_at)], **fit_kw)
         iters = int(est.best_iteration_ or est.n_estimators)
     elif model == "randomforest":  # без ранней остановки: время ограничено числом деревьев
         from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
         est = (RandomForestRegressor if regression else RandomForestClassifier)(**params)
-        est.fit(x_tr, y_tr)
+        est.fit(x_tr, y_tr, **fit_kw)
         iters = int(params["n_estimators"])
     elif model == "catboost":
         from catboost import CatBoostClassifier, CatBoostRegressor
         if early_stopping > 0:
             est = (CatBoostRegressor if regression else CatBoostClassifier)(**params)
-            est.fit(x_tr, y_tr, cat_features=cats or None, eval_set=(x_es, y_es), callbacks=[_CatBoostTimer(stop_at)])
+            est.fit(x_tr, y_tr, cat_features=cats or None, eval_set=(x_es, y_es), callbacks=[_CatBoostTimer(stop_at)],
+                    **fit_kw)
         else:
             fixed = {k: v for k, v in params.items() if k not in ("od_type", "od_wait", "use_best_model")}
             est = (CatBoostRegressor if regression else CatBoostClassifier)(**fixed)
-            est.fit(x_tr, y_tr, cat_features=cats or None, callbacks=[_CatBoostTimer(stop_at)])
+            est.fit(x_tr, y_tr, cat_features=cats or None, callbacks=[_CatBoostTimer(stop_at)], **fit_kw)
         iters = int(est.get_best_iteration() or est.tree_count_)
     else:
         from xgboost import XGBClassifier, XGBRegressor
         if early_stopping > 0:
             est = (XGBRegressor if regression else XGBClassifier)(**params, callbacks=[_xgb_timer(stop_at)])
-            est.fit(x_tr, y_tr, eval_set=[(x_es, y_es)], verbose=False)
+            est.fit(x_tr, y_tr, eval_set=[(x_es, y_es)], verbose=False, **fit_kw)
         else:
             fixed = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
             est = (XGBRegressor if regression else XGBClassifier)(**fixed, callbacks=[_xgb_timer(stop_at)])
-            est.fit(x_tr, y_tr, verbose=False)
+            est.fit(x_tr, y_tr, verbose=False, **fit_kw)
         iters = int(getattr(est, "best_iteration", None) or params["n_estimators"])
 
     if regression:
@@ -709,11 +748,16 @@ class Run:
 
 def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at: float, *,
              transform: str | None = None, extra: dict | None = None, threads: int = 1,
-             exclude: tuple[str, ...] = (), entity: bool = False, early_stopping: int | None = None) -> Run:
+             exclude: tuple[str, ...] = (), entity: bool = False, early_stopping: int | None = None,
+             sample_weight: np.ndarray | None = None, target_keys: Any = (),
+             max_train_rows: int | None = None) -> Run:
     """K-fold с фиксированными фолдами: OOF, среднее по фолдам на test, оценка metrics.score на каждом фолде.
 
     entity — добавить признаки по таргету той же сущности (entity_features), считаются внутри каждого фолда.
     early_stopping — терпение ранней остановки (None — из cfg; 0 — без неё, ровно n_estimators из extra/params).
+    Действия агента: sample_weight — веса строк train при обучении; target_keys — [(key_train, key_test), ...]
+    ключи для признаков по таргету (target_key_features); max_train_rows — подвыборка строк обучения фолда
+    (стратифицированно по классу; быстрый скрининг на больших задачах; валидация — целиком).
     """
     start = time.monotonic()
     regression = data.task == "regression"
@@ -730,6 +774,8 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
         now = time.monotonic()
         fold_stop = now + max(1.0, (stop_at - now) / (data.n_splits - f))
         train_idx, valid_idx = np.flatnonzero(data.folds != f), np.flatnonzero(data.folds == f)
+        if max_train_rows and len(train_idx) > max_train_rows:
+            train_idx = _subsample(train_idx, None if regression else data.y[train_idx], max_train_rows, cfg.seed + f)
         y_tr = data.y[train_idx]
         if transform == "log1p":
             y_tr = np.log1p(y_tr)
@@ -740,10 +786,17 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
             x_tr = x_tr.assign(**dict(zip(names, e_tr.T)))
             x_va = x_va.assign(**dict(zip(names, e_va.T)))
             x_te = x_te.assign(**dict(zip(names, e_te.T)))
+        for i, (key, key_test) in enumerate(target_keys or ()):
+            names = target_key_names(i, data)
+            k_tr, k_va, k_te = target_key_features(data, key, key_test, train_idx, valid_idx)
+            x_tr = x_tr.assign(**dict(zip(names, k_tr.T)))
+            x_va = x_va.assign(**dict(zip(names, k_va.T)))
+            x_te = x_te.assign(**dict(zip(names, k_te.T)))
         p_va, p_te, iters, present = _fit_predict(
             model, regression, params, x_tr, y_tr, x_va,
             np.log1p(data.y[valid_idx]) if transform == "log1p" else data.y[valid_idx], x_te, cats, fold_stop,
-            cfg.early_stopping if early_stopping is None else early_stopping)
+            cfg.early_stopping if early_stopping is None else early_stopping,
+            None if sample_weight is None else np.asarray(sample_weight, dtype=float)[train_idx])
         if regression:
             if transform == "log1p":
                 p_va, p_te = np.expm1(p_va), np.expm1(p_te)
@@ -760,6 +813,19 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
         iterations.append(iters)
     return Run(name, model, oof, test_pred, scores, time.monotonic() - start, params, transform, iterations,
                tuple(exclude), bool(entity and data.entity is not None), dict(extra or {}))
+
+
+def _subsample(rows: np.ndarray, y: np.ndarray | None, size: int, seed: int) -> np.ndarray:
+    """size строк из rows (по возрастанию); при y — пропорционально классам, каждый класс хотя бы одной строкой."""
+    rng = np.random.default_rng(seed)
+    if y is None:
+        return np.sort(rng.choice(rows, size, replace=False))
+    keep = []
+    for c in np.unique(y):
+        members = rows[y == c]
+        n = max(1, int(round(size * len(members) / len(rows))))
+        keep.append(rng.choice(members, min(n, len(members)), replace=False))
+    return np.sort(np.concatenate(keep))
 
 
 # ---------------------------------------------------------------- бленд и кандидаты
