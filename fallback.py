@@ -667,6 +667,31 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
 
 # ---------------------------------------------------------------- бленд и кандидаты
 
+@dataclass
+class FallbackContext:
+    """Из чего собран лучший кандидат — для AutoML и агента (тот же рецепт с новыми признаками), в meta["context"].
+
+    members — имя Run → вес в лучшем кандидате (одиночная модель — {имя: 1.0}, константа — {}).
+    """
+    data: TaskData
+    runs: list[Run]
+    config: FallbackConfig
+    members: dict[str, float]
+
+
+def pool(best: Candidate) -> list[Candidate]:
+    """Кандидат на каждую обученную модель fallback (OOF на его фолдах) — для финального бленда; нет context → []."""
+    ctx = (getattr(best, "meta", None) or {}).get("context")
+    if ctx is None:
+        return []
+    data = ctx.data
+    return [Candidate(f"fallback_{r.name}", r.cv, float(np.std(r.fold_scores)), r.oof, r.test_pred,
+                      {"fold_scores": list(r.fold_scores), "fold_scores_eff": list(r.fold_scores),
+                       "folds": data.folds, "train_rows": data.rows, "classes": data.classes, "metric": data.metric,
+                       "model": r.model, "cv_score_post": r.cv})
+            for r in ctx.runs]
+
+
 def _fold_scores(data: TaskData, oof: np.ndarray) -> list[float]:
     return [metrics.score(data.metric, data.y[data.folds == f], oof[data.folds == f]) for f in range(data.n_splits)]
 
@@ -955,6 +980,11 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
                                                                                                "test_known")},
                      runs=[{"name": r.name, "cv": r.cv, "std": float(np.std(r.fold_scores)),
                             "seconds": round(r.seconds, 1)} for r in runs])
+    if best.meta.get("model") == "blend":
+        members = dict(best.meta.get("members") or {})
+    else:
+        members = {r.name: 1.0 for r in runs if f"fallback_{r.name}" == best.name}
+    best.meta["context"] = FallbackContext(data, runs, cfg, members)  # для AutoML и агента; поведение не меняет
     log.info("fallback готов за %.0f с: %s cv=%.6g (с порогом/весами: %.6g)", time.monotonic() - start, best.name,
              best.cv_score, best.meta.get("cv_score_post", best.cv_score))
     return best
