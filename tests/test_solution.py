@@ -39,10 +39,12 @@ def test_fallback_only_without_llm(tmp_path):
 
 
 def test_agent_writes_submission_only_when_clearly_better(tmp_path, caplog, monkeypatch):
-    # fallback — один LightGBM: признак x1*x2 (главный сигнал синтетики) честно лучше; CatBoost fallback выучил бы его сам
+    # fallback — один LightGBM: признак x1*x2 (главный сигнал синтетики) честно лучше; CatBoost fallback выучил бы его сам.
+    # 3 сида явно (по умолчанию 5): с 5 на этой синтетике бленд «bag5 + один сид» в допуске BLEND_TOLERANCE и пишется
+    # как «агент (ensemble)», хотя агент ничего не добавил, — тест проверяет правило записи кандидатов агента
     run = fallback.run
     monkeypatch.setattr(fallback, "run", lambda spec, deadline=None: run(
-        spec, deadline, fallback.FallbackConfig(models=("lightgbm",), try_log_target=False)))
+        spec, deadline, fallback.FallbackConfig(models=("lightgbm",), try_log_target=False, bag_seeds=3)))
     spec = make_regression_task(tmp_path / "reg")
     llm = MockLLM({"planner": [plan("Interaction x1*x2")], "coder": [fenced(GOOD_CODE)]})
     with caplog.at_level(logging.INFO):

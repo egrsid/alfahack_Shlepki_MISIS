@@ -100,7 +100,7 @@ def blended(tmp_path, monkeypatch):
                         lambda metric, new, old, k=1.0: new.name == "fallback_blend" and "_bag" not in old.name)
     # без потолка «N × время первой модели»: под нагрузкой таймер обрезал бы сид bag3, и сравнение с bag() — нечестное
     best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm", "xgboost"), try_log_target=False,
-                                                            job_cap_units=1e6))
+                                                            job_cap_units=1e6, bag_seeds=3))  # явно: по умолчанию 5
     monkeypatch.undo()
     assert best.name == "fallback_blend_bag3" and best.meta.get("honest")
     return spec, best
@@ -126,7 +126,7 @@ def test_blend_reference_is_honest_and_bag_reproduces_fallback(blended):
 @pytest.fixture
 def bagged_task(tmp_path):
     spec = make_regression_task(tmp_path / "reg", n_train=500)
-    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm",), try_log_target=False))
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm",), try_log_target=False, bag_seeds=3))
     assert best.meta.get("bagged_seeds") == 3
     return spec, best
 
