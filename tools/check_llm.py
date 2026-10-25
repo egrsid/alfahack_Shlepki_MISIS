@@ -1,6 +1,6 @@
 """Smoke-test доступа к LLM: один короткий запрос.
 
-Запуск: .venv/bin/python check_llm.py
+Запуск: .venv/bin/python tools/check_llm.py
 Ключ и адрес берутся из .env или из переменных окружения (на платформе их задаёт она сама).
 """
 

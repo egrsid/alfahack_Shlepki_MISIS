@@ -1,9 +1,13 @@
 """Сборка сабмита на платформу: плоский ZIP (все файлы в корне архива, без папок). Вне ZIP.
 
     .venv/bin/python tools/make_zip.py                 # → dist/solution_<коммит>.zip
+    .venv/bin/python tools/make_zip.py --smoke         # + дымовой прогон solution.py в чистой папке (как платформа)
     .venv/bin/python tools/make_zip.py --out dist/x.zip
 
-Проверки перед упаковкой: все файлы на месте, нет ключей и абсолютных путей к своей машине, размер < 100 МБ.
+Берутся ровно файлы FILES из корня репозитория (в корне только модули решения; вспомогательное — в tools/).
+Проверки перед упаковкой: все файлы на месте, нет ключей и абсолютных путей к своей машине, размер < 100 МБ, и
+проверки tools/package.py (P3): каждый файл компилируется, все обязательные импорты — в архиве или установлены,
+requirements.txt не изменён. tools/package.py — для сборки из уже распакованного архива с подменой модулей.
 """
 
 from __future__ import annotations
@@ -35,7 +39,11 @@ def check(root: Path = ROOT) -> list[str]:
             problems.append(f"{name}: нет файла")
         elif SECRET.search(path.read_text(encoding="utf-8")):
             problems.append(f"{name}: похоже на ключ или абсолютный путь")
-    return problems
+    if problems:
+        return problems
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import package  # tools/package.py (P3): компиляция, импорты, requirements, ключи
+    return package.check({name: root / name for name in FILES}, root / "requirements.txt")
 
 
 def build(out: Path, root: Path = ROOT) -> Path:
@@ -54,6 +62,7 @@ def build(out: Path, root: Path = ROOT) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--smoke", action="store_true", help="дымовой прогон solution.py без LLM в чистой папке")
     args = parser.parse_args()
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True,
                             text=True).stdout.strip() or "local"
@@ -61,6 +70,11 @@ def main() -> int:
     with zipfile.ZipFile(out) as archive:
         names = archive.namelist()
     print(f"{out}: {out.stat().st_size // 1024} КБ, файлов {len(names)}: {', '.join(names)}")
+    if args.smoke:
+        import package
+        problems = package.smoke(out, timeout=900.0)
+        print("дымовой прогон:", "ok" if not problems else "ОШИБКИ:\n- " + "\n- ".join(problems))
+        return 1 if problems else 0
     return 0
 
 
