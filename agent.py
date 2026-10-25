@@ -25,7 +25,7 @@ import sys
 import time
 import types
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 
 import prompts_agent as P
-from agent_eval import Candidate, LocalEvaluator, find_file  # Candidate — из schemas.py (P1), если он есть
+from agent_eval import Candidate, LocalEvaluator, RecipeEvaluator, find_file  # Candidate — из schemas.py (P1), если он есть
 from error_analysis import analyze_errors
 from memory import Experiment, ExperimentMemory, code_diff, code_hash, columns_in, normalize_title
 from postprocess import apply_weights, fit_class_weights
@@ -594,6 +594,17 @@ PARAMS = {}
 TARGET_TRANSFORM = None
 '''
 
+# режим «поверх fallback» (RecipeEvaluator): все исходные колонки уже идут в модели fallback, код добавляет новые
+BASE_CODE_EXTRA = '''import numpy as np
+import pandas as pd
+
+
+def build_features(train, test, spec):
+    # all original columns already reach the baseline models (preprocessed); add NEW columns below
+    X_train, X_test = train.copy(), test.copy()
+    return X_train, X_test
+'''
+
 # то же для задач с текстовыми колонками: + TF-IDF слов и биграмм на train+test → SVD (без таргета).
 # Предобученные модели и эмбеддинги запрещены правилами: смысл текста — только из данных задачи.
 BASE_CODE_TEXT = '''import numpy as np
@@ -1129,12 +1140,14 @@ _LEVEL_ALIASES = {"medium": "mid", "moderate": "mid", "med": "mid"}
 
 def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int,
                          is_duplicate: Callable[[str, str], bool] | None = None,
-                         can_tune: bool = False, can_search_models: bool = False) -> tuple[list[Hypothesis], str]:
+                         can_tune: bool = False, can_search_models: bool = False,
+                         allowed: tuple[str, ...] | None = None) -> tuple[list[Hypothesis], str]:
     """Ответ планировщика → гипотезы без повторов (с памятью и между собой), по убыванию выигрыш/стоимость.
 
     tried — точные повторы названий; is_duplicate(title, kind) — повторы по смыслу (перефразированные).
     Без тюнера (can_tune=False) гипотеза tune становится params: параметры подберёт кодер;
     без выбора модели (can_search_models=False) model_search становится model: модель сменит кодер.
+    allowed — допустимые виды (режим «поверх fallback»: только новые колонки); остальные отбрасываются.
     """
     analysis, items = "", data
     if isinstance(data, dict):
@@ -1161,6 +1174,8 @@ def normalize_hypotheses(data: Any, task_type: str, tried: list[str], max_n: int
         if kind == P.MODEL_SEARCH_KIND and not can_search_models:
             kind = "model"
         if kind == "target_transform" and task_type != "regression":
+            continue
+        if allowed is not None and kind not in allowed:
             continue
         levels = []
         for field_name in ("expected_gain", "cost"):
@@ -1200,6 +1215,7 @@ class _Research:
         self.reference_seconds = 60.0
         self.stop_reason = ""
         self.workdir = Path(spec.task_dir) / cfg.workdir_name
+        self.recipe = bool(getattr(evaluate, "recipe_mode", False))  # поверх fallback: только новые колонки
 
     # ---------------------------------------------------------------- главный цикл
     def run(self) -> list[Candidate]:
@@ -1347,6 +1363,8 @@ class _Research:
             self.reference_seconds = float(meta.get("seconds", self.reference_seconds))
             self._update_errors()
             return True
+        if self.recipe:
+            return self._init_recipe_reference()
         start_code = base_code_for(self.data.spec_dict)
         start = time.monotonic()
         cand, error = self._evaluate_code(start_code, "exp_00_base")
@@ -1362,6 +1380,22 @@ class _Research:
         best_cv = f"{float(self.best.cv_score):.5g}" if self.best is not None else "n/a"
         log.info("research: reference %s=%.5g (input best %s), %.0fs", self.data.spec_dict["metric"],
                  cand.cv_score, best_cv, self.reference_seconds)
+        self._update_errors()
+        return True
+
+    def _init_recipe_reference(self) -> bool:
+        """Точка отсчёта — лучший кандидат fallback: его рецепт без новых колонок, оценённый тем же evaluator."""
+        start = time.monotonic()
+        cand, error = self._evaluate_code(BASE_CODE_EXTRA, "exp_00_base")
+        self.reference_seconds = time.monotonic() - start
+        if cand is None:
+            log.warning("research: fallback recipe failed, stopping: %s", P.clip(error, 500))
+            return False
+        self.base_code, self.current, self.best = BASE_CODE_EXTRA, cand, cand  # результат — не хуже рецепта
+        fallback_cv = (getattr(self.best, "meta", None) or {}).get("cv_score_post")
+        log.info("research: reference = fallback recipe %s=%.5g (fallback reported %s), %.0fs",
+                 self.data.spec_dict["metric"], cand.cv_score,
+                 f"{float(fallback_cv):.5g}" if fallback_cv is not None else "n/a", self.reference_seconds)
         self._update_errors()
         return True
 
@@ -1472,7 +1506,7 @@ class _Research:
         messages = P.build_plan_messages(
             task_line=self.task_line, task_text=self.task_text, profile=self.profile_text, base_code=self.base_code,
             cv_text=self._cv_text(), n=cfg.hypotheses_per_plan, errors=self.errors_text,
-            can_tune=self.tuner is not None, can_search_models=cfg.model_search,
+            can_tune=self.tuner is not None, can_search_models=cfg.model_search, recipe=self.recipe,
             memory=self.memory.planner_brief(cfg.memory_chars, kinds=self._kinds(), task_type=self.task_type),
             task_chars=cfg.task_text_chars, profile_chars=cfg.profile_chars, memory_chars=cfg.memory_chars)
         kw = dict(max_tokens=cfg.plan_max_tokens, temperature=cfg.plan_temperature)
@@ -1496,7 +1530,8 @@ class _Research:
         hypotheses, analysis = normalize_hypotheses(data, self.task_type, tried, cfg.hypotheses_per_plan,
                                                     is_duplicate=self._duplicate_check(),
                                                     can_tune=self.tuner is not None,
-                                                    can_search_models=cfg.model_search)
+                                                    can_search_models=cfg.model_search,
+                                                    allowed=P.RECIPE_KINDS if self.recipe else None)
         if analysis:
             self.insights = P.clip(analysis, 500)
         self.queue.extend(hypotheses)
@@ -1504,6 +1539,8 @@ class _Research:
                  "; ".join(f"[{h.kind}] {h.title}" for h in hypotheses))
 
     def _kinds(self) -> tuple[str, ...]:
+        if self.recipe:
+            return P.RECIPE_KINDS
         return (P.KINDS + ((P.MODEL_SEARCH_KIND,) if self.cfg.model_search else ())
                 + ((P.TUNE_KIND,) if self.tuner is not None else ()))
 
@@ -1554,7 +1591,7 @@ class _Research:
             task_line=self.task_line, columns=self.columns_text, insights=self.insights, base_code=self.base_code,
             cv_text=self._cv_text(), hypothesis=asdict(hypothesis),
             memory=self.memory.summary(cfg.coder_memory_chars, recent=4), memory_chars=cfg.coder_memory_chars,
-            model_params=MODEL_PARAMS, timeout=cfg.features_timeout)
+            model_params=MODEL_PARAMS, timeout=cfg.features_timeout, recipe=self.recipe)
         kw = dict(max_tokens=cfg.code_max_tokens, temperature=cfg.code_temperature)
         answer = self._llm("chat", messages, **kw)
         code = extract_code(answer)
@@ -1570,7 +1607,8 @@ class _Research:
         cfg = self.cfg
         messages = P.build_repair_messages(
             task_line=self.task_line, columns=self.columns_text, hypothesis=asdict(hypothesis), code=code,
-            error=error, model_params=MODEL_PARAMS, timeout=cfg.features_timeout, error_chars=cfg.error_chars)
+            error=error, model_params=MODEL_PARAMS, timeout=cfg.features_timeout, error_chars=cfg.error_chars,
+            recipe=self.recipe)
         return extract_code(self._llm("chat", messages, max_tokens=cfg.code_max_tokens,
                                       temperature=cfg.code_temperature))
 
@@ -1835,13 +1873,19 @@ def research(spec: Any, best: Candidate | None, llm: LLMClient | None, deadline:
         log.warning("research: evaluator.evaluate недоступен — исследование пропущено")
         return []
 
+    if getattr(evaluate, "recipe_mode", False):  # модели, параметры и веса классов — у рецепта fallback
+        cfg = replace(cfg, model_search=False, auto_model_search=False, auto_tune=False, postprocess=False)
+        tuner = None
+        no_tuner = True
+    else:
+        no_tuner = False
     loop = None
     try:
         loop = _Research(spec, best, llm, deadline, cfg, evaluate=evaluate,
                          run_code=run_code or _optional("sandbox", "run_code") or _local_run_code,
                          profile=profile or _optional("eda", "profile"),
                          guards=guards or _optional("guards", "check_candidate"), data=data,
-                         tuner=tuner or _optional("tuning", "tune"))
+                         tuner=None if no_tuner else tuner or _optional("tuning", "tune"))
         return loop.run()
     except LLMUnavailable as error:
         log.warning("research: LLM недоступна (%s) — возвращаем накопленное", P.clip(str(error), 300))

@@ -21,6 +21,9 @@ TUNE_KIND = "tune"  # подбор гиперпараметров тюнером
 TUNE_KIND_LINE = ("- tune: automatic hyperparameter search for the current model on the current features "
                   "(no code is written; title like \"Tune lightgbm hyperparameters\"); best after features stop improving")
 MODEL_SEARCH_KIND = "model_search"  # сравнить все бустинги на текущих признаках тем же evaluator, без кодера
+RECIPE_KINDS = ("features", "encoding", "missing")  # режим «поверх fallback»: только новые колонки
+RECIPE_RULE = ("A strong baseline (preprocessing, models, their blend, class weights) is fixed: an experiment may "
+               "only ADD new columns; changing or dropping existing columns has no effect.")
 MODEL_SEARCH_KIND_LINE = ("- model_search: compare lightgbm, catboost and xgboost on the current features, keep the "
                           "best (no code; title like \"Compare boosting models\")")
 
@@ -230,11 +233,23 @@ def _hypothesis_text(hypothesis: dict) -> str:
     return text
 
 
+_PLANNER_INTRO = "with fixed K-fold CV. Each experiment changes ONE thing in the current best solution"
+_RECIPE_DROP_KINDS = ("- outliers:", "- target_transform:", "relative error, so it suits", "- params:", "- model:",
+                      "- feature_selection:")
+assert _PLANNER_INTRO in PLANNER_SYSTEM
+
+
+def _recipe_planner(system: str) -> str:
+    """Планировщик «поверх fallback»: без видов гипотез про модель/параметры/удаление, с правилом про новые колонки."""
+    lines = [line for line in system.split("\n") if not line.startswith(_RECIPE_DROP_KINDS)]
+    return "\n".join(lines).replace("\nRules:\n", f"\nRules:\n- {RECIPE_RULE}\n", 1)
+
+
 def build_plan_messages(*, task_line: str, task_text: str, profile: str, base_code: str, cv_text: str,
                         memory: str, n: int = 6, task_chars: int = 1200, profile_chars: int = 5000,
                         code_chars: int = 2000, memory_chars: int = 1500, errors: str = "",
                         errors_chars: int = 800, can_tune: bool = False,
-                        can_search_models: bool = False) -> list[dict]:
+                        can_search_models: bool = False, recipe: bool = False) -> list[dict]:
     user = (f"## Task\n{task_line}\n{clip(task_text, task_chars)}\n\n"
             f"## Data profile\n{clip(profile, profile_chars)}\n\n"
             f"## Current best solution ({cv_text})\n```python\n{clip(base_code, code_chars)}\n```\n\n"
@@ -242,19 +257,33 @@ def build_plan_messages(*, task_line: str, task_text: str, profile: str, base_co
             + f"## Memory\n{clip(memory, memory_chars)}\n\n"
             f"Propose up to {n} new hypotheses as ONE JSON object.")
     system = PLANNER_SYSTEM.format(n=n)
+    if recipe:
+        system = _recipe_planner(system)
     extra_kinds = ([MODEL_SEARCH_KIND_LINE] if can_search_models else []) + ([TUNE_KIND_LINE] if can_tune else [])
     if extra_kinds:
         system = system.replace(_LAST_KIND_LINE, "\n".join([_LAST_KIND_LINE, *extra_kinds]))
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def _coder_system(model_params: dict[str, dict], timeout: float) -> str:
-    return CODER_SYSTEM.format(params_help=params_help(model_params), timeout=int(timeout))
+_CODER_CONSTANTS = CODER_SYSTEM[CODER_SYSTEM.index("Optional module-level constants"):
+                                CODER_SYSTEM.index("Implement ONLY the given hypothesis")]
+_CODER_EXAMPLE_CONSTANTS = CODER_SYSTEM[CODER_SYSTEM.index('\n\nMODEL = "lightgbm"\nPARAMS = {{"n_estimators"'):
+                                        CODER_SYSTEM.rindex("\n```")]
+_CODER_RETURN = "- Return `(X_train, X_test)`:"
+
+
+def _coder_system(model_params: dict[str, dict], timeout: float, recipe: bool = False) -> str:
+    system = CODER_SYSTEM
+    if recipe:  # модель и параметры — у рецепта fallback; LLM только добавляет колонки
+        system = (system.replace(_CODER_CONSTANTS, "").replace(_CODER_EXAMPLE_CONSTANTS, "")
+                  .replace(_CODER_RETURN, f"- Keep every input column and ADD new ones: only new column names reach "
+                                          f"the model (the originals are already used, preprocessed).\n{_CODER_RETURN}"))
+    return system.format(params_help=params_help(model_params), timeout=int(timeout))
 
 
 def build_code_messages(*, task_line: str, columns: str, insights: str, base_code: str, cv_text: str,
                         hypothesis: dict, memory: str, model_params: dict[str, dict], timeout: float,
-                        columns_chars: int = 2500, memory_chars: int = 800) -> list[dict]:
+                        columns_chars: int = 2500, memory_chars: int = 800, recipe: bool = False) -> list[dict]:
     user = (f"## Task\n{task_line}\n\n"
             f"## Columns of `train`/`test` (raw input of build_features)\n{clip(columns, columns_chars)}\n\n"
             + (f"## Data insights\n{clip(insights, 500)}\n\n" if insights else "")
@@ -262,12 +291,12 @@ def build_code_messages(*, task_line: str, columns: str, insights: str, base_cod
             f"## Hypothesis to implement\n{_hypothesis_text(hypothesis)}\n\n"
             f"## Memory (already tried)\n{clip(memory, memory_chars)}\n\n"
             "Return the COMPLETE updated module in ONE ```python block.")
-    return [{"role": "system", "content": _coder_system(model_params, timeout)}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": _coder_system(model_params, timeout, recipe)}, {"role": "user", "content": user}]
 
 
 def build_repair_messages(*, task_line: str, columns: str, hypothesis: dict, code: str, error: str,
                           model_params: dict[str, dict], timeout: float, error_chars: int = 1500,
-                          columns_chars: int = 2500) -> list[dict]:
+                          columns_chars: int = 2500, recipe: bool = False) -> list[dict]:
     user = (f"## Task\n{task_line}\n\n"
             f"## Columns of `train`/`test` (raw input of build_features)\n{clip(columns, columns_chars)}\n\n"
             f"## Hypothesis\n{_hypothesis_text(hypothesis)}\n\n"
@@ -275,7 +304,7 @@ def build_repair_messages(*, task_line: str, columns: str, hypothesis: dict, cod
             f"## It failed with\n```\n{clip(error, error_chars, tail=True)}\n```\n\n"
             "Fix the problem and keep implementing the hypothesis. "
             "Return the COMPLETE fixed module in ONE ```python block.")
-    return [{"role": "system", "content": _coder_system(model_params, timeout)}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": _coder_system(model_params, timeout, recipe)}, {"role": "user", "content": user}]
 
 
 def build_format_fix_messages(messages: list[dict], bad_answer: str) -> list[dict]:

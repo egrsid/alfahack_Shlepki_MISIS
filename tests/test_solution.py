@@ -119,9 +119,36 @@ def test_zip_is_flat_and_runs_in_clean_folder(tmp_path):
     task = make_multiclass_task(tmp_path / "platform" / "task")
     for name in make_zip.FILES:  # как на платформе: модули рядом с task.md, cwd — каталог задачи
         shutil.copy(tmp_path / "platform" / name, task.task_dir / name)
-    env = {"PATH": os.defpath, "LLM_DISABLED": "1", "HOME": str(tmp_path)}
+    env = {"PATH": os.defpath, "LLM_DISABLED": "1", "HOME": str(tmp_path), "SOLUTION_AUTOML_SECONDS": "60"}
     result = subprocess.run([sys.executable, "-s", "solution.py", "task.md"], cwd=task.task_dir, env=env,
                             capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stderr[-3000:]
     sub = pd.read_csv(task.task_dir / "submission.csv")
     assert list(sub.columns) == ["id", "kind"] and len(sub) == 150
+
+
+def test_automl_stage_writes_only_when_clearly_better(tmp_path, caplog, monkeypatch):
+    import automl
+
+    spec = make_multiclass_task(tmp_path / "cls")
+    monkeypatch.setenv("SOLUTION_AUTOML_SECONDS", "90")
+    with caplog.at_level(logging.INFO):
+        assert solution.solve(spec.task_dir / "task.md", llm=None, deadline=deadline()) == []
+    assert "automl: AutoGluon multiclass" in caplog.text and ("AutoML: " in caplog.text)
+    assert not (spec.task_dir / ".agent_work" / "automl").exists()
+
+    caplog.clear()
+    spec = make_regression_task(tmp_path / "reg")
+    monkeypatch.setattr(automl, "run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level(logging.INFO):
+        assert solution.solve(spec.task_dir / "task.md", llm=None, deadline=deadline()) == []
+    assert "AutoML упал" in caplog.text  # сбой AutoML не трогает сабмит fallback
+
+
+def test_automl_budget_leaves_window_for_agent(monkeypatch):
+    monkeypatch.setenv("SOLUTION_AUTOML_SECONDS", "2400")
+    assert solution.automl_seconds(deadline(research=1200), with_agent=True) == pytest.approx(300, abs=2)
+    assert solution.automl_seconds(deadline(research=1200), with_agent=False) == pytest.approx(1200, abs=2)
+    assert solution.automl_seconds(deadline(research=10_000), with_agent=True) == 2400
+    monkeypatch.setenv("SOLUTION_AUTOML_SECONDS", "0")
+    assert solution.automl_seconds(deadline(), with_agent=False) == 0

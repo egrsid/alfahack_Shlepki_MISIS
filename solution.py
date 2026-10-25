@@ -3,10 +3,11 @@
 0. понимание задачи (task_understanding): эвристики по файлам + проверенные подсказки LLM (метрика, даты, текст).
 1. fallback (P3): spec по файлам задачи, честная схема CV (периоды / группы дублей), бустинги, бленд, веса классов.
    submission.csv пишется сразу (константа), затем после каждой лучшей модели.
-2. агент (P4): LLM-цикл гипотез (признаки, выбор модели, подбор параметров, постобработка) на ТЕХ ЖЕ фолдах,
-   что у fallback; затем бленд «fallback + агент» (ensemble). Пишется лучший из кандидатов агента и бленда,
-   только если по парным фолдам он лучше fallback больше шума и прошёл guards (сверка test-прогноза с fallback).
-3. проверка записанного файла; если он испорчен — переписывается кандидатом fallback.
+2. AutoML (automl.py): AutoGluon на ТЕХ ЖЕ фолдах, до 40 мин; бленд «все модели fallback + AutoGluon».
+3. агент (P4): LLM-цикл гипотез на ТЕХ ЖЕ фолдах; затем бленд «fallback + AutoGluon + агент» (ensemble).
+   После шагов 2 и 3 пишется лучший из кандидатов и бленда, только если по парным фолдам он лучше уже записанного
+   больше шума и прошёл guards (сверка test-прогноза с fallback).
+4. проверка записанного файла; если он испорчен — переписывается кандидатом fallback.
 
 Любой сбой агента или LLM оставляет сабмит fallback. Ключ и адрес LLM — только из переменных окружения
 (OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL). Переменные SOLUTION_* — только для локальных проверок.
@@ -32,6 +33,8 @@ log = logging.getLogger("solution")
 
 TOTAL_SECONDS = 3 * 3600          # лимит платформы на задачу (включая LLM)
 RESEARCH_END = TOTAL_SECONDS - 1800  # агент не начинает ничего после T+2ч30: запас на запись и проверку
+AUTOML_SECONDS = 2400.0           # AutoGluon сразу после fallback (не зависит от LLM)
+AGENT_MIN_SECONDS = 900.0         # AutoML оставляет агенту хотя бы столько окна research
 
 
 class Deadline:
@@ -110,12 +113,21 @@ def agent_spec(spec: Any) -> Any:
 
 
 def run_agent(spec: Any, best: Any, llm: Any, deadline: Deadline, config: Any = None) -> list:
-    """Кандидаты агента по убыванию CV — на тех же фолдах и строках train, что у fallback."""
+    """Кандидаты агента по убыванию CV. Есть рецепт fallback (meta["context"]) — агент стартует с лучшего
+    кандидата fallback и добавляет к нему новые колонки (RecipeEvaluator); иначе — свой LocalEvaluator на тех же
+    фолдах и строках train."""
     import agent
 
     meta = getattr(best, "meta", None) or {}
-    evaluate = agent._optional("evaluator", "evaluate") or agent.LocalEvaluator(
-        folds=meta.get("folds"), rows=meta.get("train_rows"), early_stopping=100)  # фолды и модели как у fallback
+    evaluate = agent._optional("evaluator", "evaluate")
+    if evaluate is None and meta.get("context") is not None:
+        try:  # агент улучшает сам лучший кандидат fallback: тот же рецепт + новые колонки
+            evaluate = agent.RecipeEvaluator(best, threads=fallback.n_threads())
+        except ValueError as error:
+            log.info("агент: рецепт fallback недоступен (%s) — свой LocalEvaluator", error)
+    if evaluate is None:
+        evaluate = agent.LocalEvaluator(folds=meta.get("folds"), rows=meta.get("train_rows"),
+                                        early_stopping=100)  # фолды и модели как у fallback
     return agent.research(agent_spec(spec), best, llm, deadline, config=config, evaluate=evaluate)
 
 
@@ -132,30 +144,48 @@ def suspicious(spec: Any, cand: Any, best: Any) -> list[str]:
     return problems
 
 
-def pick(spec: Any, best: Any, found: list) -> Any | None:
-    """Что записать вместо fallback: лучший по CV из кандидатов агента и бленда «fallback + агент» (ensemble),
-    если он честно лучше fallback (парные фолды, выигрыш больше шума); иначе None — остаётся fallback."""
-    options = list(found)
-    if found:
-        try:
-            import ensemble
-            mixed = ensemble.blend(spec, [best, *found])
-            if mixed is not None:
-                options.append(mixed)
-        except Exception:
-            log.exception("бленд fallback + агент не собран")
-    good = [c for c in options if fallback.clearly_better(spec.metric, c, best) and not suspicious(spec, c, best)]
+def pick(spec: Any, current: Any, options: list, trusted: Any, stage: str) -> Any | None:
+    """Лучший по CV из options, если он честно лучше записанного current (парные фолды, выигрыш больше шума)
+    и прошёл guards против trusted (кандидат fallback); иначе None — файл не трогаем."""
+    good = [c for c in options if fallback.clearly_better(spec.metric, c, current) and not suspicious(spec, c, trusted)]
     if not good:
         if options:
             top = options[0]
-            log.info("агент: лучший кандидат %s cv=%.6g не лучше fallback (%.6g) больше шума — остаётся fallback",
-                     top.name, fallback.effective_cv(top), fallback.effective_cv(best))
+            log.info("%s: лучший кандидат %s cv=%.6g не лучше записанного %s (%.6g) больше шума", stage, top.name,
+                     fallback.effective_cv(top), current.name, fallback.effective_cv(current))
         return None
     sign = 1.0 if metrics.greater_is_better(spec.metric) else -1.0
     winner = max(good, key=lambda c: sign * fallback.effective_cv(c))
-    log.info("агент: %s cv=%.6g лучше fallback (%.6g) больше шума", winner.name, fallback.effective_cv(winner),
-             fallback.effective_cv(best))
+    log.info("%s: %s cv=%.6g лучше записанного %s (%.6g) больше шума", stage, winner.name,
+             fallback.effective_cv(winner), current.name, fallback.effective_cv(current))
     return winner
+
+
+def improve(spec: Any, best: Any, current: Any, extra: list, stage: str) -> Any:
+    """Бленд «все модели fallback + extra» и сами extra; что честно лучше записанного — пишется. Возвращает
+    то, что теперь в файле."""
+    options = list(extra)
+    if extra:
+        try:
+            import ensemble
+            mixed = ensemble.blend(spec, [best, *fallback.pool(best), *extra])
+            if mixed is not None:
+                options.insert(0, mixed)
+        except Exception:
+            log.exception("%s: бленд не собран", stage)
+    winner = pick(spec, current, options, best, stage)
+    if winner is None:
+        return current
+    submission.write_candidate(spec, winner)
+    log.info("submission.csv ← %s (%s)", stage, winner.name)
+    return winner
+
+
+def automl_seconds(deadline: Deadline, with_agent: bool) -> float:
+    """Бюджет AutoGluon: AUTOML_SECONDS (SOLUTION_AUTOML_SECONDS — для локальных проверок, 0 — выкл.), не больше
+    окна research за вычетом минимального окна агента."""
+    limit = float(os.environ.get("SOLUTION_AUTOML_SECONDS", AUTOML_SECONDS))
+    return max(0.0, min(limit, deadline.stage("research") - (AGENT_MIN_SECONDS if with_agent else 0.0)))
 
 
 def understand(task_path: Path, client: Any) -> Any:
@@ -191,18 +221,26 @@ def solve(task_path: str | Path, *, llm: Any = "auto", deadline: Deadline | None
         log.exception("fallback упал — остаётся константный сабмит")
         submission.write_dummy(spec)
 
-    if best is not None and not multi and deadline.stage("research") > 0:
+    current, found = best, []
+    if best is not None and not multi:
+        seconds = automl_seconds(deadline, client is not None)
+        if seconds > 0:
+            try:
+                import automl
+                found = automl.run(spec, best, deadline, seconds=seconds, threads=fallback.n_threads())
+                current = improve(spec, best, current, found, "AutoML")
+            except Exception:
+                log.exception("AutoML упал — остаётся сабмит fallback")
+
+    if best is not None and not multi and deadline.stage("research") > 0 and client is not None:
         try:
             if agent_config is None and os.environ.get("SOLUTION_AGENT_ITERS"):  # только для локальных проверок
                 import agent
                 agent_config = agent.AgentConfig(max_iters=int(os.environ["SOLUTION_AGENT_ITERS"]))
-            if client is not None:
-                winner = pick(spec, best, run_agent(spec, best, client, deadline, agent_config))
-                if winner is not None:
-                    submission.write_candidate(spec, winner)
-                    log.info("submission.csv ← агент (%s)", winner.name)
+            agent_cands = run_agent(spec, best, client, deadline, agent_config)
+            current = improve(spec, best, current, [*found, *agent_cands], "агент")
         except Exception:
-            log.exception("агент упал — остаётся сабмит fallback")
+            log.exception("агент упал — остаётся записанный сабмит")
 
     problems = submission.check_file(spec)
     if problems and best is not None:

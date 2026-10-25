@@ -9,6 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # в тестах реальный Qwen не вызывается никогда; MockLLM помечен offline и этим флагом не отключается
 os.environ.setdefault("LLM_DISABLED", "1")
+# AutoGluon в solution.solve — только там, где тест включает его сам (SOLUTION_AUTOML_SECONDS)
+os.environ.setdefault("SOLUTION_AUTOML_SECONDS", "0")
 
 
 import pytest  # noqa: E402

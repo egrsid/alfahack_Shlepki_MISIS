@@ -51,26 +51,32 @@ def cand(name, scores):
     return types.SimpleNamespace(name=name, cv_score=float(np.mean(scores)), meta={"fold_scores_eff": scores})
 
 
-def test_pick_takes_best_clearly_better_option(monkeypatch):
+def test_pick_takes_best_clearly_better_option():
     spec = types.SimpleNamespace(metric="rmse")
     best = cand("fallback", [1.0, 1.1, 0.9, 1.0])
-    agent_c = cand("agent", [0.95, 1.04, 0.86, 0.95])
-    monkeypatch.setattr(ensemble, "blend", lambda spec, cands: cand("ensemble", [0.9, 1.0, 0.8, 0.9]))
-    assert solution.pick(spec, best, [agent_c]).name == "ensemble"
-    monkeypatch.setattr(ensemble, "blend", lambda spec, cands: None)
-    assert solution.pick(spec, best, [agent_c]).name == "agent"
+    agent_c, blended = cand("agent", [0.95, 1.04, 0.86, 0.95]), cand("ensemble", [0.9, 1.0, 0.8, 0.9])
+    assert solution.pick(spec, best, [agent_c, blended], best, "t").name == "ensemble"
+    assert solution.pick(spec, best, [agent_c], best, "t").name == "agent"
+    assert solution.pick(spec, blended, [agent_c], best, "t") is None  # не лучше уже записанного
     noisy = cand("noisy", [0.8, 1.3, 0.7, 1.2])
-    assert solution.pick(spec, best, [noisy]) is None
-    assert solution.pick(spec, best, []) is None
+    assert solution.pick(spec, best, [noisy], best, "t") is None
+    assert solution.pick(spec, best, [], best, "t") is None
 
 
-def test_pick_survives_broken_ensemble(monkeypatch):
+def test_improve_writes_winner_and_survives_broken_ensemble(monkeypatch):
+    written = []
+    monkeypatch.setattr(solution.submission, "write_candidate", lambda spec, c: written.append(c.name))
+    spec = types.SimpleNamespace(metric="macro_f1")
+    best = cand("fallback", [0.5, 0.52, 0.48, 0.5])
+    monkeypatch.setattr(ensemble, "blend", lambda spec, cands: cand("ensemble", [0.7, 0.72, 0.68, 0.7]))
+    assert solution.improve(spec, best, best, [cand("agent", [0.6, 0.62, 0.58, 0.6])], "t").name == "ensemble"
+
     def boom(spec, cands):
         raise RuntimeError("boom")
     monkeypatch.setattr(ensemble, "blend", boom)
-    spec = types.SimpleNamespace(metric="macro_f1")
-    best = cand("fallback", [0.5, 0.52, 0.48, 0.5])
-    assert solution.pick(spec, best, [cand("agent", [0.6, 0.62, 0.58, 0.6])]).name == "agent"
+    assert solution.improve(spec, best, best, [cand("agent", [0.6, 0.62, 0.58, 0.6])], "t").name == "agent"
+    assert solution.improve(spec, best, best, [], "t") is best  # нечего предложить — файл не трогаем
+    assert written == ["ensemble", "agent"]
 
 
 def test_fallback_context_and_pool(tmp_path):

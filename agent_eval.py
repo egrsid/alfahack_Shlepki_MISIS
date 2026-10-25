@@ -343,3 +343,106 @@ class LocalEvaluator:
             meta["classes"] = classes
         return Candidate(name=f"local_{name}", cv_score=float(np.mean(fold_scores)),
                          cv_std=float(np.std(fold_scores)), oof=oof, test_pred=test_pred, meta=meta)
+
+
+# ============================================================ оценка «поверх fallback»
+
+def _safe_name(name: str) -> str:
+    return "agent__" + (re.sub(r"[^\w]", "_", str(name)).strip("_") or "col")
+
+
+class RecipeEvaluator:
+    """evaluator.evaluate(spec, build_features, cfg, deadline) -> Candidate на рецепте лучшего кандидата fallback.
+
+    best.meta["context"] (fallback.FallbackContext) — готовые матрицы fallback, фолды, обученные модели и веса
+    членов лучшего кандидата. К матрицам добавляются ТОЛЬКО новые колонки из build_features (имена, которых нет во
+    входе; префикс agent__), члены переобучаются fallback.cv_model с теми же параметрами, лог-таргетом,
+    исключениями и признаками сущности, смешиваются с теми же весами, порог/веса классов — честно
+    (fallback.make_candidate). cv_score и fold_scores — эффективные (как у fallback.clearly_better), поэтому без
+    новых колонок кандидат воспроизводит лучший fallback, а агент улучшает именно его. cfg (модель/параметры кода
+    LLM) не используется: модели — у рецепта. recipe_mode — признак для агента («только новые колонки»).
+    """
+
+    recipe_mode = True
+
+    def __init__(self, best: Any, threads: int | None = None, decision_seconds: float = 20.0) -> None:
+        ctx = (getattr(best, "meta", None) or {}).get("context")
+        if ctx is None:
+            raise ValueError("fallback candidate has no context")
+        self.ctx, self.decision_seconds = ctx, decision_seconds
+        self.runs = {r.name: r for r in ctx.runs}
+        self.members = {name: float(w) for name, w in ctx.members.items() if name in self.runs and w > 0}
+        if not self.members:
+            raise ValueError("best fallback candidate has no trained members")
+        self.threads = threads
+        self.calls = 0
+        self._inputs: tuple[pd.DataFrame, pd.DataFrame, dict] | None = None
+
+    def _raw(self, spec: Any) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+        """Сырые train/test, которые получает build_features (строки — как у fallback, индекс — номер строки)."""
+        if self._inputs is None:
+            train = pd.read_csv(find_file(spec, "train.csv"), low_memory=False)
+            test = pd.read_csv(find_file(spec, "test.csv"), low_memory=False)
+            rows = self.ctx.data.rows
+            if rows is not None:
+                train = train.iloc[np.asarray(rows, dtype=int)]
+            drop = {spec.id_col, _target_name(spec), *(getattr(spec, "drop_cols", None) or [])}
+            feats = [c for c in test.columns if c in train.columns and c not in drop]
+            spec_dict = {"task_type": spec.task_type, "metric": spec.metric,
+                         "cat_cols": list(getattr(spec, "cat_cols", None) or []),
+                         "date_cols": list(getattr(spec, "date_cols", None) or []),
+                         "text_cols": list(getattr(spec, "text_cols", None) or [])}
+            self._inputs = (train[feats], test[feats].reset_index(drop=True), spec_dict)
+        return self._inputs
+
+    def __call__(self, spec: Any, build_features: Any, params: dict | None = None, deadline: Any = None) -> Candidate:
+        import copy as copy_module
+
+        import fallback
+
+        self.calls += 1
+        ctx = self.ctx
+        train, test, spec_dict = self._raw(spec)
+        x_tr, x_te = build_features(train.copy(), test.copy(), spec_dict)
+        new = [c for c in x_tr.columns if c not in train.columns and c in x_te.columns]
+        extra_tr, extra_te = _to_model_frame(x_tr[new].reset_index(drop=True), x_te[new].reset_index(drop=True))
+        names = {c: _safe_name(c) for c in new}
+        extra_tr, extra_te = extra_tr.rename(columns=names), extra_te.rename(columns=names)
+        cat_new = [c for c in extra_tr.columns if isinstance(extra_tr[c].dtype, pd.CategoricalDtype)]
+
+        data = copy_module.copy(ctx.data)
+        data.frames = {}
+        for name in self.members:
+            model = self.runs[name].model
+            key = "lightgbm" if model in ("lightgbm", "xgboost") else model
+            if key in data.frames:
+                continue
+            x, x_test, cats = ctx.data.frame(model)
+            add_tr, add_te = extra_tr, extra_te
+            if key == "catboost" and cat_new:
+                add_tr, add_te = add_tr.astype({c: str for c in cat_new}), add_te.astype({c: str for c in cat_new})
+            data.frames[key] = (pd.concat([x.reset_index(drop=True), add_tr], axis=1),
+                                pd.concat([x_test.reset_index(drop=True), add_te], axis=1), [*cats, *cat_new])
+
+        threads = self.threads or fallback.n_threads()
+        oof = test_pred = None
+        for i, (name, weight) in enumerate(self.members.items()):
+            run = self.runs[name]
+            left = _left(deadline)
+            if left <= 0:
+                raise TimeoutError(f"evaluation stopped before member {name}")
+            stop_at = time.monotonic() + (left / (len(self.members) - i) if math.isfinite(left) else 1e9)
+            fitted = fallback.cv_model(data, name, run.model, ctx.config, stop_at, transform=run.transform,
+                                       extra=dict(run.params), threads=threads, exclude=run.exclude,
+                                       entity=run.entity)
+            oof = weight * fitted.oof if oof is None else oof + weight * fitted.oof
+            test_pred = weight * fitted.test_pred if test_pred is None else test_pred + weight * fitted.test_pred
+        scores = fallback._fold_scores(data, oof)
+        cand = fallback.make_candidate(data, "agent_recipe", oof, test_pred, scores,
+                                       {"model": "recipe", "members": dict(self.members)}, ctx.config,
+                                       self.decision_seconds)
+        eff = [float(s) for s in cand.meta["fold_scores_eff"]]
+        cand.meta.update(fold_scores_raw=cand.meta["fold_scores"], fold_scores=eff, fold_ids=data.folds,
+                         new_columns=new, evaluator="recipe")
+        cand.cv_score, cand.cv_std = float(np.mean(eff)), float(np.std(eff))
+        return cand
