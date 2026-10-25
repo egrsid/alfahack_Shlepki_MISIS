@@ -103,3 +103,11 @@ def test_pool_blend_is_scored_honestly(tmp_path):
     assert mixed.meta["honest_oof"] and len(mixed.meta["blend"]) >= 2
     assert np.mean(mixed.meta["fold_scores"]) >= np.mean(in_sample) - 1e-9  # чужие веса не лучше подобранных на себе
     assert np.mean(mixed.meta["fold_scores"]) < min(ensemble.metrics.score("rmse", y, c.oof) for c in cands)
+
+
+def test_caruana_finds_small_weight_for_weaker_diverse_model():
+    rng = np.random.default_rng(1)
+    y = rng.normal(size=20_000)
+    strong, weak = y + rng.normal(0, 1, y.size), y + rng.normal(0, 2, y.size)  # 50/50 хуже strong, 80/20 — лучше
+    weights = ensemble.caruana(y, [strong, weak], "rmse")
+    assert 0.65 <= weights[0] <= 0.9 and weights[1] > 0

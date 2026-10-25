@@ -60,9 +60,13 @@ def _aligned(cand: Any, ref: Any) -> tuple[np.ndarray, np.ndarray] | None:
 
 
 def caruana(y: np.ndarray, oofs: list[np.ndarray], metric: str, max_steps: int = MAX_STEPS) -> np.ndarray:
-    """Веса жадного отбора с возвращением (Caruana) по метрике задачи на переданных строках."""
+    """Веса жадного отбора с возвращением (Caruana) по метрике задачи на переданных строках.
+
+    Все max_steps шагов выполняются всегда, итог — лучший набор за все шаги: так достигаются веса вроде 0.8/0.2
+    со слабой, но непохожей моделью (смесь 50/50 с ней хуже — остановка на первом «нет улучшения» её теряла).
+    """
     counts = np.zeros(len(oofs))
-    current, best = None, None
+    current, best, best_counts = None, None, None
     for step in range(max_steps):
         choice, choice_score = None, None
         for i, oof in enumerate(oofs):
@@ -70,12 +74,11 @@ def caruana(y: np.ndarray, oofs: list[np.ndarray], metric: str, max_steps: int =
             value = metrics.score(metric, y, trial)
             if choice_score is None or metrics.is_better(metric, value, choice_score):
                 choice, choice_score = i, value
-        if best is not None and not metrics.is_better(metric, choice_score, best):
-            break
         counts[choice] += 1
         current = oofs[choice] if current is None else (current * step + oofs[choice]) / (step + 1)
-        best = choice_score
-    return counts / counts.sum()
+        if best is None or metrics.is_better(metric, choice_score, best):
+            best, best_counts = choice_score, counts.copy()
+    return best_counts / best_counts.sum()
 
 
 def _mix(weights: np.ndarray, arrays: list[np.ndarray], rows: Any = slice(None)) -> np.ndarray:
@@ -116,6 +119,7 @@ def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0) -> Any
 
     weights = caruana(y, oofs, metric)
     if (weights > 0).sum() < 2:
+        log.info("ensemble: бленд не нужен — лучше всех одна модель %s", names[int(np.argmax(weights))])
         return None
     # честная оценка: веса для фолда f подбираются на остальных фолдах, оценка — на f
     fold_ids = np.unique(folds)
