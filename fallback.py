@@ -93,6 +93,9 @@ class FallbackConfig:
     decision_seconds: float = 40.0
     # итоговые модели (одиночная или участники бленда) переобучаются с bag_seeds сидами и усредняются: снижает дисперсию
     # без подгонки под CV (public-регрессия: сиды 42/43/44 — 41.37/41.78/41.86, среднее трёх — 41.31)
+    # test-прогноз — среднее моделей фолдов, а не одна модель на всём train: проверено на отложенном годе public-регрессии
+    # (модель на годах 1–4 → год 5) — переобучение на всём train хуже на 1.3–7 RMSE (модели «без одного периода»
+    # устойчивее к эффектам конкретного периода), на мультиклассе — в пределах шума (+0.001)
     bag_seeds: int = 3
     write: bool = True
     threads: int | None = None
@@ -316,21 +319,68 @@ def identity_columns(train_x: pd.DataFrame, test_x: pd.DataFrame, exclude: set) 
     return found
 
 
+def static_columns(train_x: pd.DataFrame, test_x: pd.DataFrame, key_cols: list[str], exclude: set,
+                   min_static: float = 0.9, min_diversity: float = 0.5, max_columns: int = 300,
+                   max_rows: int = 200_000) -> list[str]:
+    """Колонки, которые почти не меняются внутри сущности (постоянны в ≥ min_static групп ключа из ≥ 2 строк), но
+    разные у разных сущностей (разнообразие Джини значений ≥ min_diversity). Они уточняют ключ: разделяют разные
+    сущности с одинаковой идентичностью (public-регрессия: здания одной площади, но разного года постройки).
+    Почти постоянные колонки (разнообразие мало) не уточняют ничего и не берутся. На больших данных — по случайной
+    части групп (не больше max_rows строк)."""
+    full = pd.concat([train_x, test_x], ignore_index=True)
+    key = pd.factorize(pd.util.hash_pandas_object(full[key_cols].astype(str), index=False))[0]
+    rows = np.flatnonzero(np.bincount(key)[key] >= 2)
+    if len(rows) < 20:
+        return []
+    if len(rows) > max_rows:
+        groups = np.unique(key[rows])
+        chosen = np.random.default_rng(0).choice(groups, max(1, int(len(groups) * max_rows / len(rows))), replace=False)
+        rows = rows[np.isin(key[rows], chosen)]
+    found = []
+    for col in [c for c in full.columns if c not in key_cols and c not in exclude][:max_columns]:
+        codes = pd.factorize(full[col], use_na_sentinel=False)[0]  # пропуск — отдельное значение
+        share = np.bincount(codes) / len(codes)
+        if 1.0 - float(np.sum(share ** 2)) < min_diversity:
+            continue
+        constant = pd.Series(codes[rows]).groupby(key[rows]).nunique() == 1
+        if constant.mean() >= min_static:
+            found.append(col)
+    return found
+
+
+def _entity_key(frame: pd.DataFrame, cols: list[str]) -> np.ndarray:
+    return pd.util.hash_pandas_object(frame[cols].astype(str), index=False).to_numpy()
+
+
 def find_entity(train_x: pd.DataFrame, test_x: pd.DataFrame, exclude: set) -> dict | None:
-    """Ключ сущности = колонки-идентичности + категориальные колонки (≤ 200 уровней). None — сущностей нет."""
+    """Ключ сущности = колонки-идентичности + категориальные колонки (≤ 200 уровней). None — сущностей нет.
+
+    Уровни: грубый ключ (больше совпадений) и, если нашлись статичные колонки (static_columns), уточнённый — точнее,
+    но покрывает меньше строк test. Признаки считаются по каждому уровню, выбирает модель.
+    """
     identity = identity_columns(train_x, test_x, exclude)
     if not identity:
         return None
     cats = [c for c in train_x.columns if c not in identity and c not in exclude
             and not pd.api.types.is_numeric_dtype(train_x[c]) and train_x[c].nunique() <= 200]
     cols = identity + cats
-    key_train = pd.util.hash_pandas_object(train_x[cols].astype(str), index=False).to_numpy()
-    key_test = pd.util.hash_pandas_object(test_x[cols].astype(str), index=False).to_numpy()
-    return {"columns": cols, "identity": identity, "test_known": round(float(np.isin(key_test, key_train).mean()), 4),
-            "key_train": key_train, "key_test": key_test}
+    static = static_columns(train_x, test_x, cols, set(exclude) | set(cols))
+    levels = [{"columns": c, "key_train": _entity_key(train_x, c), "key_test": _entity_key(test_x, c)}
+              for c in ([cols, cols + static] if static else [cols])]
+    for level in levels:
+        level["test_known"] = round(float(np.isin(level["key_test"], level["key_train"]).mean()), 4)
+    return {"columns": cols, "identity": identity, "static": static, "test_known": levels[0]["test_known"],
+            "key_train": levels[0]["key_train"], "key_test": levels[0]["key_test"], "levels": levels}
 
 
 ENTITY_FEATURES = ("entity__mean", "entity__count", "entity__median")
+
+
+def entity_names(entity: dict | None) -> tuple[str, ...]:
+    """Имена признаков сущности: ENTITY_FEATURES для грубого ключа, entity2__* — для уточнённого."""
+    levels = (entity or {}).get("levels") or [None]
+    return ENTITY_FEATURES + tuple(f"entity{i + 1}__{stat}" for i in range(1, len(levels))
+                                   for stat in ("mean", "count", "median"))
 
 
 def _entity_stats(key_src: np.ndarray, y_src: np.ndarray, key_dst: np.ndarray) -> np.ndarray:
@@ -348,8 +398,16 @@ def entity_features(data: "TaskData", train_idx: np.ndarray, valid_idx: np.ndarr
 
     Есть порядок периодов (test — новый период): каждая строка видит только более ранние периоды, как test.
     Иначе — вложенный out-of-fold: строка обучающего фолда j видит остальные обучающие фолды.
+    Столбцы — по уровням ключа (find_entity), в порядке entity_names.
     """
-    key, y, order = data.entity["key_train"], data.y, data.period_order
+    levels = data.entity.get("levels") or [data.entity]
+    parts = [_entity_level(data, level["key_train"], level["key_test"], train_idx, valid_idx) for level in levels]
+    return tuple(np.hstack([part[i] for part in parts]) for i in range(3))  # type: ignore[return-value]
+
+
+def _entity_level(data: "TaskData", key: np.ndarray, key_test: np.ndarray, train_idx: np.ndarray,
+                  valid_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    y, order = data.y, data.period_order
     groups = order if order is not None else data.folds
     feat_tr = np.zeros((len(train_idx), len(ENTITY_FEATURES)))
     for g in np.unique(groups[train_idx]):
@@ -361,7 +419,7 @@ def entity_features(data: "TaskData", train_idx: np.ndarray, valid_idx: np.ndarr
         rows = valid_idx[groups[valid_idx] == g]
         src = train_idx[groups[train_idx] < g] if order is not None else train_idx
         feat_va[np.searchsorted(valid_idx, rows)] = _entity_stats(key[src], y[src], key[rows])
-    feat_te = _entity_stats(key[train_idx], y[train_idx], data.entity["key_test"])  # для test весь train — прошлое
+    feat_te = _entity_stats(key[train_idx], y[train_idx], key_test)  # для test весь train — прошлое
     return feat_tr, feat_va, feat_te
 
 
@@ -466,8 +524,9 @@ def load(spec: Any, cfg: FallbackConfig) -> TaskData:
         except Exception as error:  # noqa: BLE001 — признаки сущности необязательны
             log.warning("поиск сущности пропущен: %s", error)
         if entity is not None:
-            log.info("сущность: ключ %s (идентичности %s), в test узнаётся %.1f%% строк", entity["columns"],
-                     entity["identity"], 100 * entity["test_known"])
+            log.info("сущность: ключ %s (идентичности %s), в test узнаётся %.1f%% строк; уточнение %s — %s",
+                     entity["columns"], entity["identity"], 100 * entity["test_known"], entity["static"] or "нет",
+                     ", ".join(f"{100 * level['test_known']:.1f}%" for level in entity["levels"][1:]) or "-")
     return TaskData(spec, task, metric, y, classes, prep, folds, n_splits, scheme, period_feature, rows=rows,
                     entity=entity, period_order=period_order)
 
@@ -658,10 +717,11 @@ def cv_model(data: TaskData, name: str, model: str, cfg: FallbackConfig, stop_at
             y_tr = np.log1p(y_tr)
         x_tr, x_va, x_te = x.iloc[train_idx], x.iloc[valid_idx], x_test
         if entity and data.entity is not None:
+            names = entity_names(data.entity)
             e_tr, e_va, e_te = entity_features(data, train_idx, valid_idx)
-            x_tr = x_tr.assign(**dict(zip(ENTITY_FEATURES, e_tr.T)))
-            x_va = x_va.assign(**dict(zip(ENTITY_FEATURES, e_va.T)))
-            x_te = x_te.assign(**dict(zip(ENTITY_FEATURES, e_te.T)))
+            x_tr = x_tr.assign(**dict(zip(names, e_tr.T)))
+            x_va = x_va.assign(**dict(zip(names, e_va.T)))
+            x_te = x_te.assign(**dict(zip(names, e_te.T)))
         p_va, p_te, iters, present = _fit_predict(
             model, regression, params, x_tr, y_tr, x_va,
             np.log1p(data.y[valid_idx]) if transform == "log1p" else data.y[valid_idx], x_te, cats, fold_stop,
@@ -908,7 +968,7 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
             except Exception as error:  # noqa: BLE001
                 data.label_shift = {"used": False, "error": str(error)[:200]}
         consider(f"fallback_{result.name}", result.oof, result.test_pred, result.fold_scores,
-                 {"model": result.model, "params": result.params, "target_transform": result.transform,
+                 {"run": result.name, "model": result.model, "params": result.params, "target_transform": result.transform,
                   "excluded": list(result.exclude), "entity": result.entity, "iterations": result.iterations,
                   "seconds": round(result.seconds, 1)})
 
@@ -937,9 +997,8 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
     def bag_best() -> Candidate | None:
         """Итоговые модели (одиночная или участники бленда) с bag_seeds сидами; None — не успеваем или не к чему."""
         meta = best.meta
-        members = meta.get("members") or {best.name.removeprefix("fallback_"): 1.0}
-        member_runs = [next((r for r in runs if r.name == name), None) for name in members]
-        if any(r is None for r in member_runs):
+        members, member_runs = members_of(best)
+        if not member_runs:
             return None
         need = sum(r.seconds for r in member_runs) * (cfg.bag_seeds - 1)
         if need > 0.8 * (left() - 15.0 - decision_seconds):
@@ -959,10 +1018,16 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
             oof = oof + weight * sum(oofs) / len(oofs)
             test_pred = test_pred + weight * sum(tests) / len(tests)
         name = f"{best.name}_bag{cfg.bag_seeds}"
-        keep = {k: meta[k] for k in ("model", "params", "target_transform", "excluded", "entity", "members")
-                if k in meta}
-        return make_candidate(data, name, oof, test_pred, _fold_scores(data, oof), {**keep, "bagged_seeds": cfg.bag_seeds},
+        keep = {k: meta[k] for k in ("model", "params", "target_transform", "excluded", "entity") if k in meta}
+        return make_candidate(data, name, oof, test_pred, _fold_scores(data, oof),
+                              {**keep, "members": members, "bagged_seeds": cfg.bag_seeds},
                               cfg, min(decision_seconds, left() / 4))
+
+    def members_of(cand: Candidate) -> tuple[dict, list[Run]]:
+        """Участники кандидата (имя прогона → вес) и их прогоны; ({}, []) — прогон не найден."""
+        members = cand.meta.get("members") or {cand.meta.get("run"): 1.0}
+        member_runs = [next((r for r in runs if r.name == name), None) for name in members]
+        return (members, member_runs) if member_runs and all(r is not None for r in member_runs) else ({}, [])
 
     jobs = _plan(data, cfg)
     for i, (name, model, extra) in enumerate(jobs):
@@ -1032,7 +1097,7 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
     best.meta.update(seconds=round(time.monotonic() - start, 1), preprocess=data.prep.report,
                      label_shift=data.label_shift,
                      entity_key=None if data.entity is None else {k: data.entity[k] for k in ("columns", "identity",
-                                                                                               "test_known")},
+                                                                                               "static", "test_known")},
                      runs=[{"name": r.name, "cv": r.cv, "std": float(np.std(r.fold_scores)),
                             "seconds": round(r.seconds, 1)} for r in runs])
     log.info("fallback готов за %.0f с: %s cv=%.6g (с порогом/весами: %.6g)", time.monotonic() - start, best.name,
