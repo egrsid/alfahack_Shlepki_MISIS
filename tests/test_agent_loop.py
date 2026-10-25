@@ -92,7 +92,7 @@ def test_happy_path_accumulates_and_returns_better(reg_task):
     assert [r["status"] for r in experiments(reg_task)] == ["accepted", "rejected"]
     assert llm.calls[0][1][-1]["content"].endswith("/no_think")
     assert not (reg_task.task_dir / "submission.csv").exists()
-    assert not list((reg_task.task_dir / ".agent_work" / "input").glob("*.parquet"))
+    assert not list((reg_task.task_dir / ".agent_work" / "input").glob("*.frame"))
 
 
 def test_multiclass_greater_is_better(tmp_path):

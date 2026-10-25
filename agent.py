@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -546,22 +547,71 @@ def _mini_profile(data: TaskData) -> dict:
     return {"n_train": len(data.train_x), "n_test": len(data.test_x), "target": target, "columns": columns}
 
 
-def _parquet_safe(frame: pd.DataFrame) -> pd.DataFrame:
-    frame = frame.copy()
-    frame.columns = [str(c) for c in frame.columns]
-    for col in frame.columns:
-        if frame[col].dtype == object:  # смешанные типы в object pyarrow не пишет
-            frame[col] = frame[col].where(frame[col].isna(), frame[col].astype(str))
-    return frame
+# Обмен таблицами харнесс ↔ песочница: без pyarrow/fastparquet (на платформе их может не быть) и без pickle (выход
+# песочницы пишет процесс с кодом LLM — распаковка pickle исполнила бы его код у харнесса). Папка <name>.frame:
+# meta.json (колонки, типы) + c<i>.npy (числа, bool, даты как int64 нс; allow_pickle=False) или c<i>.json (строки).
+# Один исходник: исполняется здесь и вставляется в раннер песочницы.
+FRAME_IO = '''
+def save_frame(frame, path):
+    import json, os
+    import numpy as np
+    import pandas as pd
+    os.makedirs(path, exist_ok=True)
+    columns = []
+    for i, name in enumerate(frame.columns):
+        s = frame[name]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            if getattr(s.dt, "tz", None) is not None:
+                s = s.dt.tz_convert(None)
+            np.save(os.path.join(path, f"c{i}.npy"), s.to_numpy("datetime64[ns]").astype("int64"), allow_pickle=False)
+            kind = "datetime"
+        elif (pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s)) and not isinstance(
+                s.dtype, pd.CategoricalDtype):
+            if s.isna().any() and not pd.api.types.is_float_dtype(s):  # Int64/boolean с NA → float
+                s = s.astype("float64")
+            values = s.to_numpy()
+            if values.dtype == object:
+                values = s.astype("float64").to_numpy()
+            np.save(os.path.join(path, f"c{i}.npy"), values, allow_pickle=False)
+            kind = "array"
+        else:  # строки, категории, смешанное: текст или null
+            values = [None if pd.isna(v) else str(v) for v in s.astype(object).tolist()]
+            with open(os.path.join(path, f"c{i}.json"), "w", encoding="utf-8") as fh:
+                json.dump(values, fh, ensure_ascii=False)
+            kind = "str"
+        columns.append({"name": str(name), "kind": kind})
+    with open(os.path.join(path, "meta.json"), "w", encoding="utf-8") as fh:
+        json.dump({"columns": columns, "rows": int(len(frame))}, fh, ensure_ascii=False)
+
+
+def load_frame(path):
+    import json, os
+    import numpy as np
+    import pandas as pd
+    with open(os.path.join(path, "meta.json"), encoding="utf-8") as fh:
+        meta = json.load(fh)
+    data = {}
+    for i, col in enumerate(meta["columns"]):
+        if col["kind"] == "str":
+            with open(os.path.join(path, f"c{i}.json"), encoding="utf-8") as fh:
+                data[col["name"]] = pd.Series(json.load(fh), dtype=object)
+        else:
+            values = np.load(os.path.join(path, f"c{i}.npy"), allow_pickle=False)
+            data[col["name"]] = pd.Series(values.astype("datetime64[ns]") if col["kind"] == "datetime" else values)
+    frame = pd.DataFrame(data, columns=[c["name"] for c in meta["columns"]])
+    return frame if len(frame) or not meta["rows"] else frame.reindex(range(meta["rows"]))
+'''
+exec(FRAME_IO, globals())  # save_frame, load_frame
 
 
 def write_inputs(data: TaskData, workdir: Path) -> tuple[Path, Path]:
     """Вход песочницы: признаки без таргета, id и drop_cols. Таргет в песочницу не попадает никогда."""
     folder = Path(workdir) / "input"
     folder.mkdir(parents=True, exist_ok=True)
-    paths = folder / "train_X.parquet", folder / "test_X.parquet"
-    _parquet_safe(data.train_x).to_parquet(paths[0], index=False)
-    _parquet_safe(data.test_x).to_parquet(paths[1], index=False)
+    paths = folder / "train_X.frame", folder / "test_X.frame"
+    for frame, path in zip((data.train_x, data.test_x), paths):
+        shutil.rmtree(path, ignore_errors=True)
+        save_frame(frame, str(path))
     return paths
 
 
@@ -718,6 +768,7 @@ import json
 import sys
 
 import pandas as pd
+__FRAME_IO__
 
 
 def fail(message):
@@ -753,8 +804,8 @@ def frame(name, value, n):
 def main():
     with open("spec.json", encoding="utf-8") as fh:
         spec = json.load(fh)
-    train = pd.read_parquet(__TRAIN__)
-    test = pd.read_parquet(__TEST__)
+    train = load_frame(__TRAIN__)
+    test = load_frame(__TEST__)
     n_train, n_test = len(train), len(test)
     loader = importlib.util.spec_from_file_location("features", "features.py")
     module = importlib.util.module_from_spec(loader)
@@ -762,8 +813,8 @@ def main():
     result = module.build_features(train, test, spec)
     if not (isinstance(result, tuple) and len(result) == 2):
         fail("build_features must return a tuple (X_train, X_test)")
-    frame("X_train", result[0], n_train).to_parquet("feat_train.parquet")
-    frame("X_test", result[1], n_test).to_parquet("feat_test.parquet")
+    save_frame(frame("X_train", result[0], n_train), "feat_train.frame")
+    save_frame(frame("X_test", result[1], n_test), "feat_test.frame")
 
 
 main()
@@ -785,13 +836,14 @@ def run_features(code: str, exp_dir: Path, inputs: tuple[Path, Path], data: Task
     """Построить признаки кодом LLM в песочнице и проверить результат харнессом."""
     exp_dir = Path(exp_dir)
     exp_dir.mkdir(parents=True, exist_ok=True)
-    outputs = exp_dir / "feat_train.parquet", exp_dir / "feat_test.parquet"
+    outputs = exp_dir / "feat_train.frame", exp_dir / "feat_test.frame"
     for path in outputs:
-        path.unlink(missing_ok=True)
+        shutil.rmtree(path, ignore_errors=True)
     (exp_dir / "features.py").write_text(code, encoding="utf-8")
     (exp_dir / "spec.json").write_text(json.dumps(data.spec_dict, ensure_ascii=False, default=str),
                                        encoding="utf-8")
-    runner = RUNNER.replace("__TRAIN__", repr(str(inputs[0]))).replace("__TEST__", repr(str(inputs[1])))
+    runner = (RUNNER.replace("__FRAME_IO__", FRAME_IO).replace("__TRAIN__", repr(str(inputs[0])))
+              .replace("__TEST__", repr(str(inputs[1]))))
 
     start = time.monotonic()
     try:
@@ -804,19 +856,19 @@ def run_features(code: str, exp_dir: Path, inputs: tuple[Path, Path], data: Task
         return FeatureOutcome(error=f"timeout: building features took longer than {timeout:.0f} s; "
                                     "the code is too slow or too heavy", seconds=seconds, timed_out=True)
     stderr = str(getattr(result, "stderr", "") or "")
-    if getattr(result, "returncode", 1) != 0 or not all(p.exists() for p in outputs):
+    if getattr(result, "returncode", 1) != 0 or not all((p / "meta.json").exists() for p in outputs):
         harness = [line for line in stderr.splitlines() if line.startswith("HARNESS_ERROR: ")]
         error = (harness[-1].removeprefix("HARNESS_ERROR: ") if harness
                  else stderr.strip()[-4000:] or f"process exited with code {getattr(result, 'returncode', '?')}")
         return FeatureOutcome(error=error, seconds=seconds)
     try:
-        x_train, x_test = pd.read_parquet(outputs[0]), pd.read_parquet(outputs[1])
+        x_train, x_test = load_frame(str(outputs[0])), load_frame(str(outputs[1]))
     except Exception as error:
         return FeatureOutcome(error=f"cannot read features: {type(error).__name__}: {error}", seconds=seconds)
     finally:
         if not cfg.keep_artifacts:
             for path in outputs:
-                path.unlink(missing_ok=True)
+                shutil.rmtree(path, ignore_errors=True)
     x_train, x_test, problems, notes = validate_features(x_train, x_test, data, cfg)
     if problems:
         return FeatureOutcome(error="; ".join(problems), notes=notes, seconds=seconds)
@@ -1418,8 +1470,8 @@ class _Research:
         try:
             self.memory.dump_jsonl(self.workdir / "experiments.jsonl")
             if not self.cfg.keep_artifacts:
-                for path in (self.workdir / "input").glob("*.parquet"):
-                    path.unlink(missing_ok=True)
+                for path in (self.workdir / "input").glob("*.frame"):
+                    shutil.rmtree(path, ignore_errors=True)
         except OSError as error:
             log.warning("research: cannot write artifacts: %s", error)
 

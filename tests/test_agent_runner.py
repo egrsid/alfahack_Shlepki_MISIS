@@ -29,7 +29,7 @@ def test_load_task_data_hides_target_and_id(env):
     assert list(data.train_x.columns) == ["x1", "x2", "x3", "city"] == list(data.test_x.columns)
     assert len(data.y) == 400 and data.spec_dict["target"] == "target" and data.spec_dict["cat_cols"] == ["city"]
     assert 0 < data.nan_share < 0.05
-    assert list(pd.read_parquet(inputs[0]).columns) == ["x1", "x2", "x3", "city"]
+    assert list(agent.load_frame(str(inputs[0])).columns) == ["x1", "x2", "x3", "city"]
 
 
 def test_load_task_data_finds_files_in_subdir(tmp_path):
@@ -55,7 +55,7 @@ def test_good_code_builds_features(env):
     assert isinstance(out.x_train["city"].dtype, pd.CategoricalDtype)
     assert out.x_train["city"].dtype == out.x_test["city"].dtype
     assert np.allclose(out.x_train["x1_x2"], out.x_train["x1"] * out.x_train["x2"])
-    assert not (env[2] / "good" / "feat_train.parquet").exists()  # артефакты подчищены
+    assert not (env[2] / "good" / "feat_train.frame").exists()  # артефакты подчищены
 
 
 def test_base_code_is_identity_plus_prep(env):
