@@ -71,8 +71,9 @@ class HeuristicSpec:
 
 @dataclass
 class FallbackConfig:
-    # потолок на весь fallback, с (45 мин из 3 ч): AutoGluon на отложенных частях обеих public-задач слабее fallback,
-    # а на железе платформы (8 vCPU, медленнее ноутбука) мультиклассу с 5 сидами 25 мин может не хватить
+    # потолок на весь fallback, с (45 мин из 3 ч; решение P3 и P1/P4): регрессия укладывается в ~5–15 мин, остальное время
+    # уходит зоопарку (final.py); потолок срабатывает на медленном железе платформы, где за 25 мин не успевают сиды.
+    # Зоопарк на мультиклассе поверх бленда fallback прироста не дал (0.6466 против 0.6500), сиды на регрессии — дали
     time_budget: float = 2700.0
     reserve: float = 20.0            # не трогаем последние N секунд дедлайна
     n_splits: int = 5
@@ -200,7 +201,8 @@ def guess_spec(task_path: str | Path) -> Any:
     train_cols = list(pd.read_csv(submission.task_file(probe, "train.csv"), nrows=0).columns)
     test_cols = list(pd.read_csv(submission.task_file(probe, "test.csv"), nrows=0).columns)
 
-    id_col = sample_cols[0] if sample_cols[0] in test_cols and len(sample_cols) > 1 else None
+    # id — колонка образца, которая есть в test (обычно первая; бывает «target,id» — тогда без него не пишется ничего)
+    id_col = next((c for c in sample_cols if c in test_cols), None) if len(sample_cols) > 1 else None
     targets = [c for c in sample_cols if c != id_col and c in train_cols and c not in test_cols]
     if not targets:  # имя таргета в образце другое — берём колонки train, которых нет в test
         targets = [c for c in train_cols if c not in test_cols and c != id_col][:max(1, len(sample_cols) - 1)]
@@ -1025,7 +1027,8 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
 
     def bag_best() -> Candidate | None:
         """Итоговые модели (одиночная или участники бленда) с bag_seeds сидами — или со сколькими успеваем (не меньше
-        двух); None — не успеваем или не к чему."""
+        двух: тогда cfg до конца run — копия с этим числом сидов); None — не успеваем или не к чему."""
+        nonlocal cfg
         meta = best.meta
         members, member_runs = members_of(best)
         if not member_runs:
@@ -1038,10 +1041,12 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
         if seeds < cfg.bag_seeds:
             log.info("усреднение по сидам: успеваем %d из %d (сид ~%.0f с, осталось %.0f с)", seeds, cfg.bag_seeds,
                      per_seed, left())
+            cfg = copy.copy(cfg)
+            cfg.bag_seeds = seeds
         oof, test_pred = 0.0, 0.0
         for run_, weight in zip(member_runs, members.values()):
             oofs, tests = [run_.oof], [run_.test_pred]
-            for k in range(1, seeds):
+            for k in range(1, cfg.bag_seeds):
                 seed_key = "random_seed" if run_.model == "catboost" else "random_state"
                 again = attempt(f"{run_.name}_seed{k}", run_.model, {**run_.extra, seed_key: cfg.seed + k},
                                 run_.transform, 1.0, run_.exclude, entity=run_.entity)
@@ -1051,10 +1056,10 @@ def run(spec: Any, deadline: Any = None, config: FallbackConfig | None = None) -
                 tests.append(again.test_pred)
             oof = oof + weight * sum(oofs) / len(oofs)
             test_pred = test_pred + weight * sum(tests) / len(tests)
-        name = f"{best.name}_bag{seeds}"
+        name = f"{best.name}_bag{cfg.bag_seeds}"
         keep = {k: meta[k] for k in ("model", "params", "target_transform", "excluded", "entity") if k in meta}
         return make_candidate(data, name, oof, test_pred, _fold_scores(data, oof),
-                              {**keep, "members": members, "bagged_seeds": seeds},
+                              {**keep, "members": members, "bagged_seeds": cfg.bag_seeds},
                               cfg, min(decision_seconds, left() / 4))
 
     def members_of(cand: Candidate) -> tuple[dict, list[Run]]:

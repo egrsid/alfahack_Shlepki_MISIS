@@ -141,6 +141,17 @@ def test_guess_spec_from_files(tmp_path):
     assert (spec.target, spec.task_type, spec.metric) == ("label", "binary", "roc_auc")
 
 
+def test_id_not_first_in_sample(tmp_path):
+    spec, _ = regression_task(tmp_path)
+    sample = pd.read_csv(tmp_path / "sample_submission.csv")
+    sample[["target", "id"]].to_csv(tmp_path / "sample_submission.csv", index=False)  # «target,id» вместо «id,target»
+    spec = F.guess_spec(tmp_path / "task.md")
+    assert (spec.id_col, spec.target) == ("id", "target")
+    F.run(spec, config=_cfg())
+    assert submission.check_file(spec) == []
+    assert list(pd.read_csv(tmp_path / "submission.csv").columns) == ["target", "id"]
+
+
 def test_log_target_tried_for_skewed_regression(tmp_path):
     spec, _ = regression_task(tmp_path)
     train = pd.read_csv(tmp_path / "train.csv")
