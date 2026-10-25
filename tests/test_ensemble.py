@@ -71,3 +71,29 @@ def test_pick_survives_broken_ensemble(monkeypatch):
     spec = types.SimpleNamespace(metric="macro_f1")
     best = cand("fallback", [0.5, 0.52, 0.48, 0.5])
     assert solution.pick(spec, best, [cand("agent", [0.6, 0.62, 0.58, 0.6])]).name == "agent"
+
+
+def test_fallback_context_and_pool(tmp_path):
+    spec = make_regression_task(tmp_path / "reg", n_train=500)
+    best = fallback.run(spec, None)
+    ctx = best.meta["context"]
+    assert ctx.members and abs(sum(ctx.members.values()) - 1.0) < 1e-6
+    assert set(ctx.members) <= {r.name for r in ctx.runs}
+    members = fallback.pool(best)
+    assert len(members) == len(ctx.runs) >= 2
+    assert all(m.oof.shape == best.oof.shape and m.test_pred.shape == best.test_pred.shape for m in members)
+
+
+def test_pool_blend_is_scored_honestly(tmp_path):
+    spec = make_regression_task(tmp_path / "reg", n_train=500)
+    y = ensemble._truth(spec, types.SimpleNamespace(meta={"train_rows": None, "classes": None}))
+    rng = np.random.default_rng(0)
+    folds = np.arange(len(y)) % 5
+    meta = {"folds": folds, "train_rows": None, "classes": None, "metric": "rmse"}
+    cands = [types.SimpleNamespace(name=f"m{i}", oof=y + rng.normal(0, 1, len(y)), test_pred=np.zeros(150),
+                                   meta=dict(meta)) for i in range(4)]
+    mixed = ensemble.blend(spec, cands)
+    in_sample = [ensemble.metrics.score("rmse", y[folds == f], mixed.oof[folds == f]) for f in range(5)]
+    assert mixed.meta["honest_oof"] and len(mixed.meta["blend"]) >= 2
+    assert np.mean(mixed.meta["fold_scores"]) >= np.mean(in_sample) - 1e-9  # чужие веса не лучше подобранных на себе
+    assert np.mean(mixed.meta["fold_scores"]) < min(ensemble.metrics.score("rmse", y, c.oof) for c in cands)
