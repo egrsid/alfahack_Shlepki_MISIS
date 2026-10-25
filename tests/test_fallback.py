@@ -311,6 +311,35 @@ def test_entity_features_use_only_past_and_never_own_row(tmp_path):
     assert e_te.shape == (len(data.entity["key_test"]), 3)
 
 
+def test_entity_key_refined_by_static_columns(tmp_path):
+    """Часть сущностей делит площадь с другой (разный год постройки): грубый ключ их склеивает, уточнённый — разделяет."""
+    rng = np.random.default_rng(1)
+    n = 400
+    area, kind = rng.uniform(1000, 90000, n).round(1), rng.choice(["office", "school"], n)
+    area[1:40:2], kind[1:40:2] = area[0:40:2], kind[0:40:2]  # 20 пар с одинаковыми площадью и типом
+    built, level = rng.integers(1900, 2020, n), rng.normal(80, 25, n)
+    rows = [{"year": p, "area": area[e], "kind": kind[e], "built": built[e], "temp": rng.normal(10 + p, 1),
+             "y": level[e] + rng.normal(scale=2)} for p in range(1, 7) for e in range(n) if rng.random() < 0.8]
+    df = pd.DataFrame(rows)
+    df.insert(0, "id", range(len(df)))
+    train, test = df[df.year <= 5], df[df.year == 6].drop(columns="y")
+    write_task(tmp_path, train, test, pd.DataFrame({"id": test.id, "y": 0.0}))
+    spec = Spec(tmp_path, "id", "y", "regression", "rmse")
+    data = F.load(spec, _cfg())
+    assert data.entity["static"] == ["built"] and len(data.entity["levels"]) == 2
+    names = F.entity_names(data.entity)
+    assert names[:3] == F.ENTITY_FEATURES and len(names) == 6
+    train_idx, valid_idx = np.flatnonzero(data.folds != 0), np.flatnonzero(data.folds == 0)
+    e_tr, e_va, e_te = F.entity_features(data, train_idx, valid_idx)
+    assert e_tr.shape[1] == e_va.shape[1] == e_te.shape[1] == 6
+    fine, order = data.entity["levels"][1]["key_train"], data.period_order
+    for pos in range(0, len(train_idx), 11):  # уточнённый счётчик — только прошлые строки той же сущности
+        r = train_idx[pos]
+        assert e_tr[pos, 4] == ((order[train_idx] < order[r]) & (fine[train_idx] == fine[r])).sum()
+    cand = F.run(spec, config=_cfg())
+    assert cand.meta["entity_key"]["static"] == ["built"] and submission.check_file(spec) == []
+
+
 def test_no_entity_without_repeating_identities(tmp_path):
     spec, _ = regression_task(tmp_path)  # непрерывные признаки без повторов — сущностей нет
     assert F.load(spec, _cfg()).entity is None
