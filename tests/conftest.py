@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("LLM_DISABLED", "1")
 # AutoGluon в solution.solve — только там, где тест включает его сам (SOLUTION_AUTOML_SECONDS)
 os.environ.setdefault("SOLUTION_AUTOML_SECONDS", "0")
+# зоопарк (final.py) в solution.solve — только там, где тест включает его сам (SOLUTION_FINAL_SECONDS)
+os.environ.setdefault("SOLUTION_FINAL_SECONDS", "0")
 
 
 import pytest  # noqa: E402

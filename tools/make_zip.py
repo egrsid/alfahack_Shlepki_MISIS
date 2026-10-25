@@ -26,7 +26,7 @@ FILES = ("solution.py", "requirements.txt",
          "fallback.py", "preprocess.py", "metrics.py", "submission.py",
          "llm_client.py", "sandbox.py",
          "agent.py", "agent_eval.py", "prompts_agent.py", "memory.py", "error_analysis.py", "postprocess.py",
-         "tuning.py", "ensemble.py", "task_understanding.py", "guards.py", "automl.py")
+         "tuning.py", "ensemble.py", "final.py", "task_understanding.py", "guards.py", "automl.py")
 SECRET = re.compile(r"sk-[A-Za-z0-9_-]{16,}|/Users/|/home/[a-z]")
 MAX_BYTES = 100 * 1024 * 1024
 
