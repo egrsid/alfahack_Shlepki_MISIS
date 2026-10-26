@@ -123,10 +123,10 @@ def test_solve_runs_zoo_and_keeps_valid_submission(tmp_path, monkeypatch, caplog
 def test_layout_of_three_hours(monkeypatch):
     monkeypatch.delenv("SOLUTION_FINAL_SECONDS", raising=False)  # conftest выключает зоопарк — здесь умолчания
     d = solution.Deadline(time.monotonic(), solution.TOTAL_SECONDS, solution.RESEARCH_END)
-    assert solution.RESEARCH_END == 7500 and solution.zoo_a_end(d, with_agent=True) == 4200  # T+2:05, T+1:10
+    assert solution.RESEARCH_END == 6000 and solution.zoo_a_end(d, with_agent=True) == 4200  # T+1:40, T+1:10
     assert solution.zoo_a_end(d, with_agent=False) == solution.RESEARCH_END
     agent_d = solution.agent_deadline(d)
-    assert agent_d.research_end == d.research_end and agent_d.total == 8700  # доводка агента — до T+2:25
+    assert agent_d.research_end == d.research_end and agent_d.total == 7500  # конец агента — T+2:05
     assert 9500 < solution.zoo_seconds(d, d.total) <= d.total - solution.FINAL_RESERVE  # зоопарк B — до T+2:40
     short = solution.Deadline(time.monotonic(), 3600, 1800)  # локальный прогон с коротким окном
     assert solution.zoo_a_end(short, with_agent=True) == 1800 - solution.AGENT_MIN_SECONDS
@@ -178,7 +178,7 @@ def test_bag_reseeds_weighted_fallback_models(tmp_path):
     pool = final.pool_members(best)
     assert {c.name for c in pool} >= {"fallback_lightgbm", "fallback_randomforest"}
     assert all(c.meta["member"].model == c.meta["model"] for c in pool)
-    bagged = final.bag(spec, best, pool, {"fallback_randomforest": 0.5, "fallback_lightgbm": 0.05},
+    bagged = final.bag(spec, best, pool, {"fallback_randomforest": 0.5, "fallback_lightgbm": 0.01},
                        until=soon(), threads=2)
     assert [b.name for b in bagged] == ["fallback_randomforest_bag3"]
     single = next(c for c in pool if c.name == "fallback_randomforest")
