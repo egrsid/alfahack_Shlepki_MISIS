@@ -42,6 +42,8 @@ def test_agent_writes_submission_only_when_clearly_better(tmp_path, caplog, monk
     # fallback — один LightGBM: признак x1*x2 (главный сигнал синтетики) честно лучше; CatBoost fallback выучил бы его сам.
     # 3 сида явно (по умолчанию 5): с 5 на этой синтетике бленд «bag5 + один сид» в допуске BLEND_TOLERANCE и пишется
     # как «агент (ensemble)», хотя агент ничего не добавил, — тест проверяет правило записи кандидатов агента
+    # правило записи бленда с допуском (BLEND_PREFERRED) — отдельно, в test_ensemble_shift: здесь только агент
+    monkeypatch.setattr(solution, "BLEND_PREFERRED", False)
     run = fallback.run
     monkeypatch.setattr(fallback, "run", lambda spec, deadline=None: run(
         spec, deadline, fallback.FallbackConfig(models=("lightgbm",), try_log_target=False, bag_seeds=3)))

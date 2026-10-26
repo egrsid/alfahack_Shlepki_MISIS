@@ -343,8 +343,9 @@ def run_zoo_a(spec: Any, best: Any, current: Any, deadline: Deadline, with_agent
 
 def run_zoo_b(spec: Any, best: Any, current: Any, deadline: Deadline, zoo: list, weights: dict,
               extra: list = (), members: list = ()) -> tuple[Any, list]:
-    """Зоопарк B — после агента до FINAL_RESERVE: сиды для членов зоопарка с весом в последнем бленде (final.bag),
-    затем ещё случайные варианты; финальный бленд всего (extra — AutoML и принятые агентом, members — пул агента).
+    """Зоопарк B — после агента до FINAL_RESERVE: сиды для членов зоопарка и моделей fallback с весом в последнем
+    бленде (final.bag, final.pool_members), затем ещё случайные варианты; финальный бленд всего (extra — AutoML и
+    принятые агентом, members — пул агента).
     Возвращает (что теперь в файле, кандидаты зоопарка — с сидами вместо одиночных, где досчитаны)."""
     seconds = zoo_seconds(deadline, deadline.total - FINAL_RESERVE)
     if seconds < 60:
@@ -354,7 +355,9 @@ def run_zoo_b(spec: Any, best: Any, current: Any, deadline: Deadline, zoo: list,
 
     start = time.monotonic()
     until, threads = start + seconds, fallback.n_threads()
-    bagged = final.bag(spec, best, zoo, weights, until=until, threads=threads) if zoo and weights else []
+    # сиды — членам зоопарка и моделям fallback с весом в бленде (у fallback сидами усреднён только его лучший)
+    bagged = final.bag(spec, best, [*zoo, *final.pool_members(best)], weights, until=until,
+                       threads=threads) if weights else []
     if bagged:
         replaced = {b.meta["bagged_from"] for b in bagged}
         zoo = [*bagged, *(c for c in zoo if c.name not in replaced)]

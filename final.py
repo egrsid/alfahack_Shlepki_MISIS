@@ -61,6 +61,8 @@ class Member:
     weights: dict | None = None
     cost: float = 1.0
     lag: bool = False      # матрицы рецепта + lag-признаки сущности (lag_data)
+    exclude: tuple[str, ...] | None = None  # None — исключения опорного прогона; модели fallback — свои
+    entity: bool | None = None              # None — признаки сущности как у опорного прогона
 
 
 def context(best: Any) -> Any:
@@ -227,9 +229,11 @@ def fit(ctx: Any, ref: Any, member: Member, stop_at: float, threads: int) -> Any
         if member.weights:
             import agent_eval
             weights = agent_eval.row_weights(data, member.weights)
+        exclude = ref.exclude if member.exclude is None else member.exclude
+        entity = ref.entity if member.entity is None else member.entity
         run = fallback.cv_model(data, member.name, member.model, ctx.config, stop_at, transform=member.transform,
-                                extra=dict(member.extra), threads=threads, exclude=tuple(ref.exclude),
-                                entity=bool(ref.entity), sample_weight=weights)
+                                extra=dict(member.extra), threads=threads, exclude=tuple(exclude),
+                                entity=bool(entity), sample_weight=weights)
     except Exception as error:  # noqa: BLE001 — сбой одной модели не роняет этап
         log.warning("final: %s упал: %s: %s", member.name, type(error).__name__, str(error)[:300])
         return None
@@ -279,6 +283,26 @@ def train(spec: Any, best: Any, until: float, threads: int | None = None, n_rand
         if run is not None:
             found.append(candidate(ctx.data, f"final_{member.name}", run.oof, run.test_pred, member, run.seconds))
     return found
+
+
+def pool_members(best: Any) -> list:
+    """Кандидаты моделей fallback (fallback.pool) с рецептом их прогона в meta["member"] — чтобы bag досчитывал сиды
+    и им: в бленде у них бывает большой вес (public-мультикласс: случайный лес 0.4, LightGBM balanced 0.24), а обучены
+    они одним сидом (сидами fallback усредняет только свой лучший кандидат)."""
+    ctx = context(best)
+    if ctx is None:
+        return []
+    runs = {f"fallback_{r.name}": r for r in ctx.runs}
+    out = []
+    for cand in fallback.pool(best):
+        run = runs.get(cand.name)
+        if run is None or run.model not in fallback._COST:
+            continue
+        member = Member(run.name, run.model, dict(run.extra), run.transform, exclude=tuple(run.exclude),
+                        entity=bool(run.entity))
+        cand.meta.update(member=member, seconds=float(run.seconds), seeds=1)
+        out.append(cand)
+    return out
 
 
 def bag(spec: Any, best: Any, cands: list, weights: dict, until: float, threads: int | None = None,

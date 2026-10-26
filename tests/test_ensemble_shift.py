@@ -150,3 +150,50 @@ def test_blend_within_tolerance_is_written_for_random_cv(tmp_path):
     close = blend_like(1.04)
     assert solution.pick(spec, best, [close], best, "test") is close      # в допуске 5% — бленд
     assert solution.pick(spec, best, [blend_like(1.08)], best, "test") is None
+
+
+def entity_task_with_new_buildings(root, n_buildings: int = 900, seed: int = 0) -> Spec:
+    """Здания (уникальная площадь) появляются в случайный год 1–5 и дальше наблюдаются каждый год: в каждом году
+    есть и знакомые, и новые здания; таргет — эффект здания + год + шум, у новых зданий эффект больше."""
+    rng = np.random.default_rng(seed)
+    area = rng.uniform(1000, 90000, n_buildings).round(1)
+    kind = rng.choice(["office", "school", "shop"], n_buildings)
+    start = rng.integers(1, 6, n_buildings)
+    effect = rng.normal(80, 25, n_buildings)
+    rows = [(b, year) for year in range(1, 6) for b in range(n_buildings) if year >= start[b]]
+    b, year = np.array([r[0] for r in rows]), np.array([r[1] for r in rows])
+    frame = pd.DataFrame({"id": np.arange(len(rows)), "year": year, "area": area[b], "kind": kind[b],
+                          "temp": rng.normal(size=len(rows))})
+    y = effect[b] + 2.0 * year + 3 * frame.temp.to_numpy() + rng.normal(scale=3, size=len(rows))
+    train, test = frame[year < 5].assign(target=y[year < 5]), frame[year == 5].reset_index(drop=True)
+    write_task(root, train, test, pd.DataFrame({"id": test.id, "target": 0.0}), "Predict target. Metric: RMSE.")
+    return Spec(root, "id", "target", "regression", "rmse", False)
+
+
+def test_entity_segments_blend_known_and_new_entities_separately(tmp_path):
+    spec = entity_task_with_new_buildings(tmp_path / "reg")
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm", "xgboost", "randomforest"),
+                                                            bag_seeds=1, write=False))
+    folds = np.asarray(best.meta["folds"])
+    known, known_test = ensemble.entity_rows(best.meta, folds)
+    order = np.asarray(best.meta["context"].data.period_order)
+    assert not known[order == order.min()].any() and known[order > order.min()].mean() > 0.5
+    assert known_test.mean() > 0.5
+
+    cands = [fallback.honest_view(best), *fallback.pool(best)]
+    plain = ensemble.blend(spec, cands)
+    mixed = ensemble.blend(spec, cands, segments=True, select="per_fold", bags=3)
+    assert mixed is not None and plain is not None
+    assert set(mixed.meta["segments"]) == {"known", "new"}
+    assert mixed.meta["segments"]["known"]["test_rows"] == int(known_test.sum())
+    assert mixed.test_pred.shape == plain.test_pred.shape and np.isfinite(mixed.test_pred).all()
+    assert len(mixed.meta["fold_scores"]) == len(plain.meta["fold_scores"])
+    assert np.isfinite(mixed.meta["fold_scores"]).all()
+
+
+def test_segments_are_off_without_entity_or_for_classification(tmp_path):
+    spec = period_task(tmp_path / "reg")  # сущности нет: у строк нет «идентичности»
+    best = fallback.run(spec, None, TWO)
+    mixed = ensemble.blend(spec, [fallback.honest_view(best), *fallback.pool(best)], segments=True, fit="last2")
+    if mixed is not None:
+        assert "segments" not in mixed.meta and mixed.meta["blend_rows"] == "last2 periods"

@@ -19,6 +19,11 @@ Test похож не на все строки train одинаково (recent, 
   На новых уровнях модели расходятся в разы: та же копия, новый в test штат — XGBoost 53 RMSE против ~40 у LightGBM
   с лог-таргетом и RandomForest, а в бленде у XGBoost вес 0.7. Оценка CV бленда от этого не меняется (на OOF таких
   строк нет), меняется только test_pred этих строк; meta["new_levels"] — сколько строк и с какими весами.
+- регрессия с повторяющейся сущностью (find_entity у fallback): свои веса для строк, где у сущности есть история, и
+  для новых сущностей (segments). У новых ошибка в разы больше (копия «годы 1–4 → год 5»: 55 против 22 RMSE), и общие
+  веса подбирались под них — модели на истории сущности (lag) получали ~0, хотя на знакомых зданиях лучшие; в
+  public-test знакомых зданий 79% строк. Веса — среднее Caruana по бутстреп-выборкам строк (bags), сильнейшие для
+  честной оценки фолда — по остальным фолдам (select="per_fold").
 """
 
 from __future__ import annotations
@@ -38,6 +43,12 @@ MAX_STEPS = 30
 MAX_POOL = 16      # кандидатов в отборе (сильнейшие по своему OOF)
 MIN_FIT_ROWS = 50  # меньше поздних строк вне фолда — веса фолда по всем его остальным строкам
 STRESS_MIN_ROWS = 100  # меньше стресс-строк OOF — отдельного бленда для новых уровней нет
+SEGMENT_MIN_ROWS = 300  # меньше строк в сегменте «сущность знакома / новая» — веса без сегментов
+LAST_MIN_SHARE = 0.1    # fit="last"/"last2": последний(е) период(ы) меньше этой доли строк — поздняя половина периодов
+# по умолчанию (замеры на копиях public-регрессии, RMSE по знакомым штатам, tools/blend_lab.py): сегменты сущности +
+# среднее весов по 10 бутстреп-выборкам — год 4: 33.48 → 32.26, год 5: 29.73 → 29.64 (fallback 34.49 / 30.08);
+# веса по последнему периоду (fit="last") — год 5: 29.22, но год 4: 33.75 (хуже) — не по умолчанию
+REGRESSION_BAGS = 10    # bags=None: столько бутстреп-выборок для метрик регрессии, 0 — для классификации (не мерили)
 
 
 def _truth(spec: Any, ref: Any) -> np.ndarray:
@@ -97,6 +108,34 @@ def _mix(weights: np.ndarray, arrays: list[np.ndarray], rows: Any = slice(None))
     return sum(w * a[rows] for w, a in zip(weights, arrays) if w > 0)
 
 
+def _top(scores: list[float], metric: str, k: int) -> np.ndarray:
+    """Номера k сильнейших по оценке (порядок — от лучшего)."""
+    sign = 1.0 if metrics.greater_is_better(metric) else -1.0
+    return np.argsort(-sign * np.asarray(scores, dtype=float), kind="stable")[:k]
+
+
+def solve(y: np.ndarray, oofs: list[np.ndarray], rows: np.ndarray, metric: str, *, pool: np.ndarray | None = None,
+          max_pool: int = MAX_POOL, bags: int = 0, seed: int = 0) -> np.ndarray:
+    """Веса всех oofs по строкам rows: отбор max_pool сильнейших по своей оценке на этих строках (pool — готовый
+    отбор), затем Caruana; bags > 1 — среднее весов Caruana по bags бутстреп-выборкам строк (веса меньше
+    подгоняются под шум конкретных строк)."""
+    if pool is None:
+        pool = _top([metrics.score(metric, y[rows], o[rows]) for o in oofs], metric, max_pool)
+    sub_y, sub = y[rows], [oofs[i][rows] for i in pool]
+    if bags > 1:
+        rng = np.random.default_rng(seed)
+        found = np.zeros(len(pool))
+        for _ in range(bags):
+            idx = rng.integers(0, len(sub_y), len(sub_y))
+            found += caruana(sub_y[idx], [o[idx] for o in sub], metric)
+        found /= bags
+    else:
+        found = caruana(sub_y, sub, metric)
+    out = np.zeros(len(oofs))
+    out[pool] = found
+    return out
+
+
 def _data(meta: dict, n_rows: int) -> Any:
     """Данные fallback (TaskData) опорного кандидата, если они про те же строки OOF; иначе None."""
     data = getattr(meta.get("context"), "data", None)
@@ -148,8 +187,42 @@ def new_level_rows(meta: dict, folds: np.ndarray) -> tuple[np.ndarray, np.ndarra
     return stress, risky
 
 
+def entity_rows(meta: dict, folds: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """(строки OOF, у чьей сущности была история, когда строку предсказывали; строки test, чья сущность есть в
+    train) по грубому ключу сущности fallback (find_entity) или None (сущности нет).
+
+    Схема «по периодам»: история — та же сущность в более раннем периоде (как у признаков сущности: строка периода g
+    видит только периоды < g). Иначе — та же сущность в других фолдах (вложенный OOF)."""
+    data = _data(meta, len(folds))
+    entity = getattr(data, "entity", None)
+    if not entity:
+        return None
+    level = (entity.get("levels") or [entity])[0]
+    key, key_test = np.asarray(level["key_train"]), np.asarray(level["key_test"])
+    if len(key) != len(folds):
+        return None
+    frame = pd.DataFrame({"k": key, "f": folds})
+    if data.period_order is not None:
+        order = np.asarray(data.period_order, dtype=float)
+        known = order > pd.Series(order).groupby(key).transform("min").to_numpy()
+    else:
+        total = frame.groupby("k")["f"].transform("size").to_numpy()
+        own = frame.groupby(["k", "f"])["f"].transform("size").to_numpy()
+        known = total > own
+    return known, np.isin(key_test, key)
+
+
 def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0, recent: bool = True,
-          new_levels: bool = True) -> Any | None:
+          new_levels: bool = True, fit: str = "recent", select: str = "per_fold", max_pool: int = MAX_POOL,
+          segments: bool = True, bags: int | None = None) -> Any | None:
+    """Бленд кандидатов (см. docstring модуля). Параметры отбора весов:
+    fit — строки для весов при схеме «по периодам»: "recent" (поздняя половина периодов), "last" / "last2"
+    (последний / два последних периода — история сущностей там как у test), "all";
+    select — отбор max_pool сильнейших: "global" — один раз по всем фолдам, "per_fold" — для честной оценки фолда f
+    по остальным фолдам (отбор по всем фолдам, включая f, завышал честную оценку тем сильнее, чем больше зоопарк);
+    segments — регрессия с сущностью: свои веса для строк, где у сущности есть история, и для новых сущностей
+    (у новых ошибка в разы больше, общие веса подбираются в основном под них);
+    bags — среднее весов Caruana по бутстреп-выборкам строк (0 — один отбор; None — REGRESSION_BAGS для регрессии)."""
     if len(cands) < 2:
         return None
     ref = cands[0]
@@ -163,10 +236,30 @@ def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0, recent
     if len(y) != len(folds):
         log.warning("ensemble: таргет %d строк, фолдов %d — без бленда", len(y), len(folds))
         return None
+    if bags is None:
+        bags = REGRESSION_BAGS if metrics.get(metric).task == "regression" else 0
 
-    fit = recent_rows(meta, len(y)) if recent else None
-    fit_all = np.ones(len(y), dtype=bool) if fit is None else fit
-    entries: list[tuple[str, np.ndarray, np.ndarray, float]] = []
+    late = recent_rows(meta, len(y)) if recent else None
+    data = _data(meta, len(y))
+    order = None
+    if late is not None and fit in ("last", "last2"):
+        order = np.asarray(data.period_order, dtype=float)
+
+    def fit_rows(inside: np.ndarray | None) -> np.ndarray:
+        """Строки для весов без строк inside (None — все): поздние периоды / последние периоды вне inside."""
+        outside = np.ones(len(y), dtype=bool) if inside is None else ~inside
+        if late is None or fit == "all":
+            return outside
+        rows = outside & late
+        if order is not None:
+            levels = np.unique(order[outside & np.isfinite(order)])
+            last = outside & np.isin(order, levels[-(1 if fit == "last" else 2):])
+            if last.sum() >= max(MIN_FIT_ROWS, LAST_MIN_SHARE * outside.sum()):
+                rows = last
+        return rows if rows.sum() >= MIN_FIT_ROWS else outside
+
+    fit_all = fit_rows(None)
+    entries: list[tuple[str, np.ndarray, np.ndarray]] = []
     seen: set[str] = set()
     for cand in cands:
         pair = _aligned(cand, ref)
@@ -175,15 +268,31 @@ def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0, recent
                 log.info("ensemble: %s не совпадает с %s по строкам/классам — пропущен", cand.name, ref.name)
             continue
         seen.add(cand.name)
-        entries.append((cand.name, pair[0], pair[1], float(metrics.score(metric, y[fit_all], pair[0][fit_all]))))
+        entries.append((cand.name, pair[0], pair[1]))
     if len(entries) < 2:
         return None
-    sign = 1.0 if metrics.greater_is_better(metric) else -1.0
-    entries = sorted(entries, key=lambda e: -sign * e[3])[:MAX_POOL]  # сильнейшие по своему OOF (на строках fit)
     names = [e[0] for e in entries]
     oofs, tests = [e[1] for e in entries], [e[2] for e in entries]
+    # сильнейшие по своему OOF на строках fit — для итоговых весов (и для честной оценки при select="global")
+    pool = _top([metrics.score(metric, y[fit_all], o[fit_all]) for o in oofs], metric, max_pool)
 
-    weights = caruana(y[fit_all], [o[fit_all] for o in oofs], metric)
+    # сегменты строк: (маска OOF, маска test); без сегментов — один «сегмент» из всех строк
+    parts = [(np.ones(len(y), dtype=bool), np.ones(len(tests[0]), dtype=bool))]
+    seg = entity_rows(meta, folds) if segments and metrics.get(metric).task == "regression" else None
+    if seg is not None:
+        known, known_test = seg
+        if min((fit_all & known).sum(), (fit_all & ~known).sum()) >= SEGMENT_MIN_ROWS:
+            parts = [(known, known_test), (~known, ~known_test)]
+        else:
+            seg = None
+
+    def weights_for(rows: np.ndarray, honest_fold: bool, salt: int) -> np.ndarray:
+        chosen = None if (honest_fold and select == "per_fold") else pool
+        return solve(y, oofs, rows, metric, pool=chosen, max_pool=max_pool, bags=bags, seed=salt)
+
+    seg_weights = [weights_for(fit_all & part, False, 1000 + i) for i, (part, _) in enumerate(parts)]
+    test_share = [float(np.mean(part_test)) for _, part_test in parts]
+    weights = sum(s * w for s, w in zip(test_share, seg_weights)) / max(sum(test_share), 1e-12)
     if (weights > 0).sum() < 2:
         log.info("ensemble: бленд не нужен — лучше всех одна модель %s", names[int(np.argmax(weights))])
         return None
@@ -192,22 +301,42 @@ def blend(spec: Any, cands: list[Any], *, decision_seconds: float = 30.0, recent
     honest = np.zeros_like(oofs[0])
     for f in fold_ids:
         inside = folds == f
-        rows = ~inside & fit_all
-        if rows.sum() < MIN_FIT_ROWS:
-            rows = ~inside
-        w_f = caruana(y[rows], [o[rows] for o in oofs], metric)
-        honest[inside] = _mix(w_f, oofs, inside)
+        base = fit_rows(inside)
+        for i, (part, _) in enumerate(parts):
+            if not (inside & part).any():
+                continue
+            rows = base & part
+            if rows.sum() < MIN_FIT_ROWS:
+                rows = ~inside & part
+            if rows.sum() < MIN_FIT_ROWS:
+                rows = base
+            honest[inside & part] = _mix(weights_for(rows, True, 10 * int(f) + i), oofs, inside & part)
     fold_scores = [float(metrics.score(metric, y[folds == f], honest[folds == f])) for f in fold_ids]
-    oof, test_pred = _mix(weights, oofs), _mix(weights, tests)
+    oof = np.zeros_like(oofs[0])
+    test_pred = np.zeros_like(np.asarray(tests[0], dtype=float))
+    for w, (part, part_test) in zip(seg_weights, parts):
+        oof[part] = _mix(w, oofs, part)
+        if part_test.any():
+            test_pred[part_test] = _mix(w, tests, part_test)
     used = {n: round(float(w), 4) for n, w in zip(names, weights) if w > 0}
     out_meta = {k: v for k, v in meta.items() if k not in ("decision", "fold_scores_post", "label_shift")}
     out_meta.update(blend=used, fold_scores=fold_scores, fold_scores_eff=list(fold_scores), decision=None,
                     cv_score_post=float(np.mean(fold_scores)), metric=metric, honest_oof=True,
-                    blend_rows="recent periods" if fit is not None else "all")
+                    blend_rows=("all" if late is None or fit == "all" else
+                                "recent periods" if fit == "recent" else f"{fit} periods"),
+                    blend_options={"fit": fit, "select": select, "max_pool": max_pool, "segments": seg is not None,
+                                   "bags": bags})
+    if seg is not None:
+        out_meta["segments"] = {
+            name: {"oof_rows": int(part.sum()), "test_rows": int(part_test.sum()),
+                   "blend": {n: round(float(v), 4) for n, v in zip(names, w) if v > 0}}
+            for name, w, (part, part_test) in zip(("known", "new"), seg_weights, parts)}
+        log.info("ensemble: сегменты сущности: знакомые %d/%d строк OOF/test, новые %d/%d",
+                 int(parts[0][0].sum()), int(parts[0][1].sum()), int(parts[1][0].sum()), int(parts[1][1].sum()))
     levels = new_level_rows(meta, folds) if new_levels else None
     if levels is not None and levels[1].any() and levels[0].sum() >= STRESS_MIN_ROWS:
         stress, risky = levels
-        w_new = caruana(y[stress], [o[stress] for o in oofs], metric)
+        w_new = solve(y, oofs, stress, metric, pool=pool)
         test_pred = np.array(test_pred, dtype=float, copy=True)
         test_pred[risky] = _mix(w_new, tests, risky)
         out_meta["new_levels"] = {"test_rows": int(risky.sum()), "stress_rows": int(stress.sum()),

@@ -169,3 +169,17 @@ def test_lag_members_for_period_task_with_entity(tmp_path):
     assert lagged and all(np.isfinite(c.test_pred).all() for c in lagged)
     bagged = final.bag(spec, best, lagged[:1], {lagged[0].name: 1.0}, until=soon(), threads=2)
     assert bagged and bagged[0].meta["member"].lag  # сиды — на тех же lag-матрицах
+
+
+def test_bag_reseeds_weighted_fallback_models(tmp_path):
+    spec = make_regression_task(tmp_path / "reg", n_train=400)
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm", "randomforest"),
+                                                            try_log_target=False, bag_seeds=1, write=False))
+    pool = final.pool_members(best)
+    assert {c.name for c in pool} >= {"fallback_lightgbm", "fallback_randomforest"}
+    assert all(c.meta["member"].model == c.meta["model"] for c in pool)
+    bagged = final.bag(spec, best, pool, {"fallback_randomforest": 0.5, "fallback_lightgbm": 0.05},
+                       until=soon(), threads=2)
+    assert [b.name for b in bagged] == ["fallback_randomforest_bag3"]
+    single = next(c for c in pool if c.name == "fallback_randomforest")
+    assert bagged[0].oof.shape == single.oof.shape and not np.allclose(bagged[0].oof, single.oof)
