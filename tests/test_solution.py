@@ -188,3 +188,32 @@ def test_pick_compares_with_honest_estimate_of_fallback_blend(tmp_path, caplog):
 def test_automl_is_off_by_default(monkeypatch):
     monkeypatch.delenv("SOLUTION_AUTOML_SECONDS", raising=False)
     assert solution.automl_seconds(deadline(research=10_000), with_agent=True) == 0
+
+
+def test_improve_offers_fallback_only_blend_next_to_full_blend(tmp_path, monkeypatch):
+    import ensemble
+    from types import SimpleNamespace
+
+    spec = make_regression_task(tmp_path / "reg", n_train=400)
+    best = fallback.run(spec, None, fallback.FallbackConfig(models=("lightgbm", "randomforest"),
+                                                            try_log_target=False, bag_seeds=1, write=False))
+    member = SimpleNamespace(name="final_member", meta={})
+    blends, seen = [], {}
+
+    def fake_blend(spec_, cands, **kw):
+        blends.append([c.name for c in cands])
+        return SimpleNamespace(name="ensemble", meta={}, test_pred=best.test_pred, oof=best.oof)
+
+    def fake_pick(spec_, current, options, trusted, stage):
+        seen["names"] = [c.name for c in options]
+        return None
+
+    monkeypatch.setattr(ensemble, "blend", fake_blend)
+    monkeypatch.setattr(solution, "pick", fake_pick)
+    monkeypatch.setattr(solution, "with_new_levels", lambda cand, mixed: None)
+    solution.improve(spec, best, best, [], "зоопарк A", members=[member])
+    assert len(blends) == 2 and "final_member" in blends[0] and "final_member" not in blends[1]
+    assert seen["names"] == ["ensemble", "ensemble_fallback"]
+    blends.clear()
+    solution.improve(spec, best, best, [], "агент")  # без extra и members второй бленд не нужен
+    assert len(blends) == 1
