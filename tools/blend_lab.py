@@ -138,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 STRATEGIES: dict[str, dict] = {
+    "v6": {"select": "global", "segments": False, "bags": 0},
     "prod": {},
     "per_fold": {"select": "per_fold"},
     "pool24_pf": {"select": "per_fold", "max_pool": 24},

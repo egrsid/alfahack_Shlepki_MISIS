@@ -272,6 +272,17 @@ def improve(spec: Any, best: Any, current: Any, extra: list, stage: str, members
             options.insert(0, mixed)
         if report is not None:
             report["blend"] = mixed
+        # второй бленд — только модели fallback: зоопарк и пул агента бывают в бленде лишними, какой писать — решает
+        # pick по честной оценке. Копия public-мультикласса: с зоопарком CV 0.6351 → отложенная часть 0.6463, только
+        # fallback — 0.6375 → 0.6532. Только если схема CV не «по периодам»: там честное CV по 2–3 поздним фолдам
+        # выбирало бленд только fallback, а на отложенном годе он хуже (копии регрессии: 29.87 против 29.54, 34.34
+        # против 32.19)
+        periods = ensemble.recent_folds(best.meta, len(np.asarray(best.oof))) is not None
+        if (extra or members) and not periods:
+            own = ensemble.blend(spec, [fallback.honest_view(best), *fallback.pool(best)])
+            if own is not None:
+                own.name = "ensemble_fallback"
+                options.append(own)
     except Exception:
         log.exception("%s: бленд не собран", stage)
     winner = pick(spec, current, options, best, stage)
@@ -343,9 +354,8 @@ def run_zoo_a(spec: Any, best: Any, current: Any, deadline: Deadline, with_agent
 
 def run_zoo_b(spec: Any, best: Any, current: Any, deadline: Deadline, zoo: list, weights: dict,
               extra: list = (), members: list = ()) -> tuple[Any, list]:
-    """Зоопарк B — после агента до FINAL_RESERVE: сиды для членов зоопарка и моделей fallback с весом в последнем
-    бленде (final.bag, final.pool_members), затем ещё случайные варианты; финальный бленд всего (extra — AutoML и
-    принятые агентом, members — пул агента).
+    """Зоопарк B — после агента до FINAL_RESERVE: сиды для членов зоопарка с весом в последнем бленде (final.bag),
+    затем ещё случайные варианты; финальный бленд всего (extra — AutoML и принятые агентом, members — пул агента).
     Возвращает (что теперь в файле, кандидаты зоопарка — с сидами вместо одиночных, где досчитаны)."""
     seconds = zoo_seconds(deadline, deadline.total - FINAL_RESERVE)
     if seconds < 60:
@@ -355,9 +365,9 @@ def run_zoo_b(spec: Any, best: Any, current: Any, deadline: Deadline, zoo: list,
 
     start = time.monotonic()
     until, threads = start + seconds, fallback.n_threads()
-    # сиды — членам зоопарка и моделям fallback с весом в бленде (у fallback сидами усреднён только его лучший)
-    bagged = final.bag(spec, best, [*zoo, *final.pool_members(best)], weights, until=until,
-                       threads=threads) if weights else []
+    # сиды — только членам зоопарка. Сиды моделям fallback (final.pool_members) проверены на копии public-мультикласса и
+    # не взяты: бленд только fallback 0.6532 → 0.6448 (замена одиночных на bag3) и 0.6349 (добавка) на отложенной части
+    bagged = final.bag(spec, best, zoo, weights, until=until, threads=threads) if zoo and weights else []
     if bagged:
         replaced = {b.meta["bagged_from"] for b in bagged}
         zoo = [*bagged, *(c for c in zoo if c.name not in replaced)]
